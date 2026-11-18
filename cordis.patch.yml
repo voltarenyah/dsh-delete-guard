@@ -1,0 +1,13 @@
+# dsh-delete-guard bundle 声明。
+# 可在 profile 的 cordis.patch.yml 里按 id 覆盖 config：
+#   - id: dsh-delete-guard
+#     config:
+#       blockAutoVarAssignment: true
+#       blockVariableDelete: true
+#       protectedPaths: ['D:\Projects\keep']
+#       maxDeletesPerWindow: 20
+#       windowSeconds: 60
+# 设置页（设置 → 删除闸门）写的是同一处配置。
+- insert:
+    - id: dsh-delete-guard
+      name: '@voltarenyah/dsh-delete-guard'

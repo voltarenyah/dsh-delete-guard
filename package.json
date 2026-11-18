@@ -1,0 +1,68 @@
+{
+  "name": "@voltarenyah/dsh-delete-guard",
+  "version": "1.0.0",
+  "description": "Delete guard for DeepSeek Harness: blocks automatic-variable assignments, variable delete targets, protected paths, and delete bursts before a shell command runs.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "docs"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "delete",
+    "guard",
+    "protected-paths",
+    "rate-limit",
+    "safety",
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "scripts": {
+    "test": "node test-guard.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voltarenyah/dsh-delete-guard.git"
+  },
+  "homepage": "https://github.com/voltarenyah/dsh-delete-guard#readme",
+  "bugs": {
+    "url": "https://github.com/voltarenyah/dsh-delete-guard/issues"
+  },
+  "author": "voltarenyah",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "MIT"
+}
