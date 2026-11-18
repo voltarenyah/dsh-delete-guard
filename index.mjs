@@ -154,7 +154,22 @@ function listOf(config, name) {
     }
   }
   if (!Array.isArray(value)) return null
-  return value.filter((v) => typeof v === 'string' && v.trim().length > 0)
+  return value
+}
+
+/** 兼容两种写法：旧版字符串数组，以及 { path, enabled } 条目。 */
+function normalizeProtected(raw) {
+  const out = []
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      if (item.trim()) out.push({ path: item.trim(), enabled: true })
+      continue
+    }
+    if (item && typeof item === 'object' && typeof item.path === 'string' && item.path.trim()) {
+      out.push({ path: item.path.trim(), enabled: item.enabled !== false })
+    }
+  }
+  return out
 }
 
 /** 读取数值型配置。 */
@@ -220,7 +235,6 @@ const DEFAULTS = {
   scanScriptExec: true,
   maxDeletesPerWindow: 20,
   windowSeconds: 60,
-  allowUntil: 0,
 }
 
 export const Config = Schema.object({
@@ -232,14 +246,18 @@ export const Config = Schema.object({
     .description('写入 .ps1/.sh/.py/.js/.cmd/.bat 等脚本时，用同一套规则扫描正文；命中则拒绝写入'),
   scanScriptExec: Schema.boolean().default(true).volatile()
     .description('执行脚本（-File、./x.ps1、bash x.sh、node x.mjs 等）前读取文件内容，用同一套规则扫描；命中则拒绝执行'),
-  protectedPaths: Schema.array(Schema.string()).default(defaultProtectedPaths()).volatile()
-    .description('受保护路径：清单中的路径本身及其祖先不接受递归删除，其下的子路径可以删除'),
+  protectedPaths: Schema.array(Schema.union([
+    Schema.string(),
+    Schema.object({
+      path: Schema.string(),
+      enabled: Schema.boolean().default(true),
+    }),
+  ])).default(defaultProtectedPaths().map((p) => ({ path: p, enabled: true }))).volatile()
+    .description('受保护路径：清单中的路径本身及其祖先不接受递归删除，其下的子路径可以删除；{ path, enabled:false } 表示暂不保护'),
   maxDeletesPerWindow: Schema.number().default(20).volatile()
     .description('删除熔断阈值：时间窗口内允许的删除类命令数，0 表示关闭'),
   windowSeconds: Schema.number().default(60).volatile()
     .description('删除熔断的时间窗口（秒）'),
-  allowUntil: Schema.number().default(0).volatile()
-    .description('临时放行截止时间（毫秒时间戳，0 表示关闭）；由设置页的「临时放行 5 分钟」写入，到点自动失效'),
 })
 
 /** 递归删除命令的「参数区」：从动词位置到行尾。 */
@@ -289,6 +307,12 @@ function hitsProtected(target, protectedList) {
   return null
 }
 
+/** 所有会被这次删除波及的受保护条目（含自身）。 */
+function blockersOf(target, protectedList) {
+  const prefix = withSep(target)
+  return protectedList.filter((item) => item === target || item.startsWith(prefix))
+}
+
 /** 读脚本正文；读不到、不是文件、或超过上限时返回 null。 */
 function readScriptText(filePath) {
   try {
@@ -330,8 +354,8 @@ function deny(reason) {
   return { kind: 'deny', reason }
 }
 
-const PROCEED_EN = 'To proceed: use a literal path and confirm it first (Resolve-Path + Write-Output). If this delete is what the user asked for, ask them to click "Allow for 5 minutes" in Settings → Delete guard, then retry.'
-const PROCEED_ZH = '要继续：改用字面路径并先打印确认（Resolve-Path + Write-Output）。如果这次删除确实是用户要的，请让用户在「设置 → 删除闸门」点击「临时放行 5 分钟」，然后重试。'
+const PROCEED_EN = 'To proceed: use a literal path and confirm it first (Resolve-Path + Write-Output). If the command is already literal and is still blocked because the target is protected, switch that path off in Settings → Delete guard (or remove it), then retry.'
+const PROCEED_ZH = '要继续：改用字面路径并先打印确认（Resolve-Path + Write-Output）。如果命令已经是字面路径、仍因保护路径被拦，请在「设置 → 删除闸门」把该路径的开关关掉（或移除），再重试。'
 
 /** 双语拒绝文案：谁看都能懂，不依赖界面语言。 */
 function blocked(en, zh) {
@@ -364,9 +388,12 @@ const PROTOCOL_SECTION = `## 删除命令硬约束（dsh-delete-guard）
 5. **不要把删除写进脚本文件再执行**：写 \`.ps1\`/\`.sh\`/\`.py\`/\`.js\` 时正文会被扫描，执行脚本前也会读文件检查；
    命中上面任何一条同样被拒绝。需要清理就写一条字面路径的命令，别封装成脚本。
 6. **被拒时不要绕过**：不要为了通过检查去改写命令（换引号、拆字符串、base64 都算绕过）。
-   如果这次删除确实是用户要求的，先向用户说明被拦的原因，请他在「设置 → 删除闸门」点击「临时放行 5 分钟」，然后重试。
-   When blocked, do not work around the check. If the user explicitly asked for that delete, explain why it was
-   blocked and ask them to click "Allow for 5 minutes" in Settings → Delete guard, then retry.
+   自动变量与变量目标两条：把命令改写成字面路径即可，不需要任何放行。
+   保护路径：如果命令已经是字面路径、仍被拦，说明这条路径在保护清单里——向用户说明情况，
+   请他在「设置 → 删除闸门」把该条路径的开关关掉（或移除），然后重试；不要自行尝试别的路径。
+   When blocked, do not work around the check. For the variable rules, rewrite the command with a literal
+   path. For a protected path, explain it and ask the user to switch that single entry off in
+   Settings → Delete guard, then retry.
 
 要清理某个构建产物或测试目录时：\`$p = 'C:\\...\\dist'; Get-ChildItem -LiteralPath $p | Measure-Object\`
 先看规模，再 \`Remove-Item -LiteralPath 'C:\\...\\dist' -Recurse -Force\`（字面量，不带变量）。`
@@ -381,37 +408,36 @@ export default {
     let warnedInvalid = false
     const deleteLog = []
 
-    /** 每 500ms 内同一份清单只解析一次。 */
+    /** 同一份清单只解析一次。 */
     function protectedList() {
       const configured = listOf(config, 'protectedPaths')
-      let source
+      let entries
       let usedDefaults = false
 
       if (configured === null) {
-        // 没配过 → 平台默认清单
-        source = defaultProtectedPaths()
+        entries = defaultProtectedPaths().map((p) => ({ path: p, enabled: true }))
         usedDefaults = true
       } else {
-        const valid = configured.filter(isAbsoluteForPlatform)
-        if (configured.length > 0 && valid.length === 0) {
-          // 配了但全部不是当前平台的绝对路径（例如从另一台机器抄来的 C:\…）→ 回落默认，fail-closed
+        const normalized = normalizeProtected(configured)
+        const valid = normalized.filter((entry) => isAbsoluteForPlatform(entry.path))
+        if (normalized.length > 0 && valid.length === 0) {
           if (!warnedInvalid) {
             warnedInvalid = true
             try {
               console.warn('[dsh-delete-guard] protectedPaths 中没有当前平台可用的绝对路径，已回落到默认清单')
             } catch {}
           }
-          source = defaultProtectedPaths()
+          entries = defaultProtectedPaths().map((p) => ({ path: p, enabled: true }))
           usedDefaults = true
         } else {
-          // 显式清空 = 不做路径保护（用户意图，UI 有提示）
-          source = valid
+          entries = valid
         }
       }
 
-      const key = `${usedDefaults ? 'd' : 'c'}|${configured === null ? 'n' : configured.length}|${source.join('|').toLowerCase()}`
+      const enabled = entries.filter((entry) => entry.enabled !== false).map((entry) => entry.path)
+      const key = `${usedDefaults ? 'd' : 'c'}|${configured === null ? 'n' : configured.length}|${enabled.join('|').toLowerCase()}`
       if (key !== protectedCacheKey) {
-        protectedCache = source.map(norm).filter(Boolean)
+        protectedCache = enabled.map(norm).filter(Boolean)
         protectedCacheKey = key
       }
       return protectedCache
@@ -457,13 +483,14 @@ export default {
       for (const token of pathTokensOf(targetText)) {
         const target = norm(token)
         if (!target) continue
-        const hit = hitsProtected(target, guarded)
-        if (hit) {
-          return deny(blocked(
-            `Recursive delete of ${target} is refused: it is a protected path (${hit}) or an ancestor of one. The list is editable in Settings → Delete guard. To clean something inside it, target the concrete subdirectory instead.`,
-            `拒绝递归删除 ${target}：它是受保护路径（${hit}）本身或它的祖先目录。清单可在 设置 → 删除闸门 调整。如果确实要清理其中某个子目录，请把命令写到那个具体子目录。`,
-          ))
-        }
+        const blockers = blockersOf(target, guarded)
+        if (blockers.length === 0) continue
+        const detail = blockers.slice(0, 6).join('、')
+        const extra = blockers.length > 6 ? ` …(+${blockers.length - 6})` : ''
+        return deny(blocked(
+          `Recursive delete of ${target} is refused: ${blockers.length === 1 ? 'it is a protected path' : `${blockers.length} protected entries are inside it`} (${detail}${extra}). The list and a per-entry switch live in Settings → Delete guard. To clean something inside it, target the concrete subdirectory; if this path itself must be deleted, switch those entries off first.`,
+          `拒绝递归删除 ${target}：${blockers.length === 1 ? '它是受保护路径' : `它下面有 ${blockers.length} 条受保护路径`}（${detail}${extra}）。清单与每条的开关在 设置 → 删除闸门。要清理其中的子目录，请直接指向那个子目录；如果确实要删这条路径本身，先把这些条目的开关关掉。`,
+        ))
       }
 
       // R4 在监听器里统一计数，此处不再重复判定
@@ -474,14 +501,7 @@ export default {
       try {
         if (!exec) return next()
 
-        // 临时放行：用户在设置页手动开的窗口，优先级最高
-        const allowUntil = number(config, 'allowUntil', 0)
-        if (allowUntil > Date.now()) {
-          try {
-            console.warn('[dsh-delete-guard] bypassed by temporary allow until', new Date(allowUntil).toISOString())
-          } catch {}
-          return next()
-        }
+        // 临时放行：已移除。放开靠「逐条路径停用」，不再有全局开关。
 
         // R5：写脚本时扫正文，把「看不见的执行期」提前到「看得见的写入期」
         if (exec.name === 'write' || exec.name === 'edit') {

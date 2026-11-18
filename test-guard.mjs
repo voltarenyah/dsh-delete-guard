@@ -224,22 +224,30 @@ const cases2 = []
   // 清理放在全部用例之后（见文件末尾），否则执行期用例读不到文件
 }
 
-// 临时放行
+// 逐条停用 + 旧格式兼容
 {
-  const bypassed = makeListener({ allowUntil: Date.now() + 60_000 })
+  const offEntry = makeListener({ protectedPaths: [{ path: 'C:\\Data', enabled: false }] })
   cases2.push({
-    label: '临时放行生效期间：原本被拒的赋值 → 放行',
-    listener: bypassed,
+    label: '该条已停用：递归删除它 → 放行',
+    listener: offEntry,
     tool: 'pwsh',
-    args: { command: '$home = "C:\\temp\\x"' },
+    args: { command: "Remove-Item -LiteralPath 'C:\\Data' -Recurse -Force" },
     expect: 'allow',
   })
-  const expired = makeListener({ allowUntil: Date.now() - 60_000 })
+  const onEntry = makeListener({ protectedPaths: [{ path: 'C:\\Data', enabled: true }] })
   cases2.push({
-    label: '临时放行过期：同一条命令 → 拒绝',
-    listener: expired,
+    label: '该条启用：同一条命令 → 拒绝',
+    listener: onEntry,
     tool: 'pwsh',
-    args: { command: '$home = "C:\\temp\\x"' },
+    args: { command: "Remove-Item -LiteralPath 'C:\\Data' -Recurse -Force" },
+    expect: 'deny',
+  })
+  const legacy = makeListener({ protectedPaths: ['C:\\Legacy'] })
+  cases2.push({
+    label: '旧版字符串数组按启用处理 → 拒绝',
+    listener: legacy,
+    tool: 'pwsh',
+    args: { command: "Remove-Item -LiteralPath 'C:\\Legacy' -Recurse -Force" },
     expect: 'deny',
   })
 }

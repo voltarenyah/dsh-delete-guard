@@ -115,7 +115,6 @@ window.__ModuleLoader__.load({
       scanScriptExec: true,
       maxDeletesPerWindow: 20,
       windowSeconds: 60,
-      allowUntil: 0,
     }
 
     const styles = {
@@ -177,18 +176,16 @@ window.__ModuleLoader__.load({
 
       const value = (snap && snap.value) || {}
       const effective = (key) => (typeof value[key] === 'boolean' ? value[key] : FULL_DEFAULTS[key])
-      const protectedPaths = Array.isArray(value.protectedPaths) ? value.protectedPaths : []
+      // 兼容旧版字符串数组与新版 { path, enabled }
+      const protectedPaths = (Array.isArray(value.protectedPaths) ? value.protectedPaths : [])
+        .map(function (item) {
+          if (typeof item === 'string') return { path: item, enabled: true }
+          if (item && typeof item.path === 'string') return { path: item.path, enabled: item.enabled !== false }
+          return null
+        })
+        .filter(Boolean)
       const maxPerWindow = typeof value.maxDeletesPerWindow === 'number' ? value.maxDeletesPerWindow : FULL_DEFAULTS.maxDeletesPerWindow
       const windowSeconds = typeof value.windowSeconds === 'number' ? value.windowSeconds : FULL_DEFAULTS.windowSeconds
-      const allowUntil = typeof value.allowUntil === 'number' ? value.allowUntil : 0
-
-      const [nowTick, setNowTick] = React.useState(Date.now())
-      const bypassLeft = allowUntil - nowTick
-      React.useEffect(function () {
-        if (!(allowUntil > Date.now())) return
-        const timer = setInterval(function () { setNowTick(Date.now()) }, 1000)
-        return function () { clearInterval(timer) }
-      }, [allowUntil])
 
       const write = function (key, next, tag) {
         setError(null)
@@ -206,7 +203,7 @@ window.__ModuleLoader__.load({
           setError(t(lang, '请填写绝对路径，例如 D:\\Projects\\my-app 或 /Users/me/projects', 'Enter an absolute path, e.g. D:\\Projects\\my-app or /Users/me/projects'))
           return
         }
-        const exists = protectedPaths.some((p) => p.toLowerCase() === candidate.toLowerCase())
+        const exists = protectedPaths.some((entry) => entry.path.toLowerCase() === candidate.toLowerCase())
         if (exists) {
           setError(t(lang, '该路径已在清单里', 'That path is already in the list'))
           return
@@ -214,22 +211,28 @@ window.__ModuleLoader__.load({
         // 祖先自动受保护：候选路径若覆盖了已有清单项，就属于重复定义
         const simple = function (p) { return p.trim().replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase() }
         const target = simple(candidate)
-        const coveredBy = protectedPaths.find(function (p) {
-          const np = simple(p)
+        const coveredBy = protectedPaths.find(function (entry) {
+          const np = simple(entry.path)
           return np === target || np.indexOf(target + '\\') === 0
         })
         if (coveredBy) {
           setError(t(lang,
-            '该路径已被「' + coveredBy + '」覆盖：清单项的上层目录自动受保护，不需要单独添加。',
-            'Already covered by "' + coveredBy + '": ancestors of a listed path are protected automatically.',
+            '该路径已被「' + coveredBy.path + '」覆盖：清单项的上层目录自动受保护，不需要单独添加。',
+            'Already covered by "' + coveredBy.path + '": ancestors of a listed path are protected automatically.',
           ))
           return
         }
-        write('protectedPaths', protectedPaths.concat(candidate), 'paths').then(function () { setDraft('') })
+        write('protectedPaths', protectedPaths.concat({ path: candidate, enabled: true }), 'paths').then(function () { setDraft('') })
       }
 
       const removePath = function (target) {
-        write('protectedPaths', protectedPaths.filter((p) => p !== target), 'paths')
+        write('protectedPaths', protectedPaths.filter((entry) => entry.path !== target), 'paths')
+      }
+
+      const togglePath = function (target, enabled) {
+        write('protectedPaths', protectedPaths.map(function (entry) {
+          return entry.path === target ? { path: entry.path, enabled: enabled } : entry
+        }), 'paths')
       }
 
       const rateOn = maxPerWindow > 0
@@ -256,17 +259,28 @@ window.__ModuleLoader__.load({
             t(lang, '受保护路径', 'Protected paths')),
           h('div', { key: 'desc', style: { fontSize: 12, opacity: 0.65, lineHeight: 1.6 } },
             t(lang,
-              '清单中的路径本身、以及它们的祖先目录都不接受递归删除；它们下面的子目录仍然可以删除。祖先目录自动包含，不需要单独添加。默认值按当前系统的用户目录与标准文件夹生成。',
-              'A listed path and its ancestors cannot be recursively deleted; anything below a listed path still can. Ancestors are included automatically. Defaults are derived from this system\'s home directory and standard folders.',
+              '清单中的路径本身、以及它们的祖先目录都不接受递归删除；它们下面的子目录仍然可以删除。祖先目录自动包含，不需要单独添加。每条前面的勾选可以单独停用该条保护，停用后此路径不再受保护。',
+              'A listed path and its ancestors cannot be recursively deleted; anything below a listed path still can. Ancestors are included automatically. The checkbox in front of each entry switches that single entry off.',
             )),
-          h('ul', { key: 'list', style: styles.list }, protectedPaths.map((p) => h('li', { key: p, style: styles.item }, [
-            h('span', { key: 'p', style: { flex: 1, wordBreak: 'break-all' } }, p),
+          h('ul', { key: 'list', style: styles.list }, protectedPaths.map((entry) => h('li', {
+            key: entry.path,
+            style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', opacity: entry.enabled ? 1 : 0.45 },
+          }, [
+            h('input', {
+              key: 'on',
+              type: 'checkbox',
+              checked: entry.enabled,
+              disabled: busy === 'paths',
+              title: t(lang, '启用这条保护', 'Enable this entry'),
+              onChange: function (e) { togglePath(entry.path, e.target.checked) },
+            }),
+            h('span', { key: 'p', style: { flex: 1, wordBreak: 'break-all' } }, entry.path),
             h('button', {
               key: 'x',
               type: 'button',
               style: styles.btn,
               disabled: busy === 'paths',
-              onClick: function () { removePath(p) },
+              onClick: function () { removePath(entry.path) },
             }, t(lang, '移除', 'Remove')),
           ]))),
           protectedPaths.length === 0
@@ -341,34 +355,6 @@ window.__ModuleLoader__.load({
                 h('span', { key: 'c' }, t(lang, '秒', 'seconds')),
               ])
             : null,
-        ]),
-
-        h('div', { key: 'allow', style: styles.row }, [
-          h('div', { key: 't', style: { fontWeight: 500, marginBottom: 4 } },
-            t(lang, '临时放行', 'Temporary allow')),
-          h('div', { key: 'd', style: { fontSize: 12, opacity: 0.65, lineHeight: 1.6, marginBottom: 8 } },
-            t(lang,
-              '开启后 5 分钟内跳过全部检查，到点自动失效。只在对某次删除确认过之后使用；被拦下的命令让模型等你开这个窗口再重试。',
-              'Skips every check for 5 minutes, then expires on its own. Use it only after confirming a specific delete; when a command is blocked, tell the agent to retry once you have opened this window.')),
-          bypassLeft > 0
-            ? h('div', { key: 'on', style: { display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 } }, [
-                h('span', { key: 's', style: { color: 'darkorange', fontWeight: 500 } },
-                  t(lang, `放行中，剩余 ${Math.ceil(bypassLeft / 1000)} 秒`, `Allowed — ${Math.ceil(bypassLeft / 1000)}s left`)),
-                h('button', {
-                  key: 'c',
-                  type: 'button',
-                  style: styles.btn,
-                  disabled: busy === 'allow',
-                  onClick: function () { write('allowUntil', 0, 'allow') },
-                }, t(lang, '立即取消', 'Cancel now')),
-              ])
-            : h('button', {
-                key: 'b',
-                type: 'button',
-                style: styles.btn,
-                disabled: busy === 'allow',
-                onClick: function () { write('allowUntil', Date.now() + 5 * 60 * 1000, 'allow') },
-              }, t(lang, '临时放行 5 分钟', 'Allow for 5 minutes')),
         ]),
 
         error ? h('p', { key: 'err', style: styles.err }, t(lang, '保存失败：', 'Save failed: ') + error) : null,

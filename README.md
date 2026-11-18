@@ -62,10 +62,9 @@ Everything is editable from **Settings → Delete guard** and takes effect on th
 | `blockVariableDelete` | `true` | Deny recursive deletes whose arguments contain `$` or `%` |
 | `scanScriptWrites` | `true` | Scan script content when a file is written through the `write`/`edit` tools |
 | `scanScriptExec` | `true` | Read the file and scan it before a script runs |
-| `protectedPaths` | platform-derived (see below) | Paths that cannot be recursively deleted |
+| `protectedPaths` | platform-derived (see below) | Paths that cannot be recursively deleted; each entry carries an `enabled` switch |
 | `maxDeletesPerWindow` | `20` | Delete commands allowed per window; `0` disables the limit |
 | `windowSeconds` | `60` | Rate-limit window |
-| `allowUntil` | `0` | Epoch milliseconds until which every check is skipped; written by **Allow for 5 minutes** |
 
 ## When a call is blocked
 
@@ -86,15 +85,18 @@ Two ways forward, and the message names both:
 
 1. **Change the command** — resolve the target to a literal path and print it first
    (`Resolve-Path` + `Write-Output`), or point the delete at a concrete subdirectory instead of a
-   protected root.
-2. **Open a five-minute window** — Settings → Delete guard → **Allow for 5 minutes**. Every check is
-   skipped until it expires, the panel shows a live countdown, and the host logs each bypassed call so
-   the window leaves a trace.
+   protected root. Both of these are things an agent follows from the instructions alone, so they are
+   not "allowed" — they are simply written correctly.
+2. **Switch that path off** — for a protected path, open Settings → Delete guard and clear the
+   checkbox in front of that entry (or remove it), then retry. Approval is per entry on purpose: there
+   is no "allow everything" button, and the refusal lists **every** entry that stands in the way, so
+   disabling one obviously does not blanket-approve the rest.
 
-![Temporary allow](docs/allow-en.png)
+![Protected paths with per-entry switches](docs/settings-en.png)
 
-The system prompt tells the agent the same thing: when blocked, explain why and ask you to open the
-window — do not retry with obfuscated variants.
+The system prompt tells the agent the same thing: rewrite the variable rules with a literal path; for a
+protected path, explain it and ask you to switch that single entry off — never work around the check
+with quoting tricks, string splitting or base64.
 
 The same values live in the profile's `cordis.patch.yml`:
 
