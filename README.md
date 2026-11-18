@@ -65,6 +65,36 @@ Everything is editable from **Settings → Delete guard** and takes effect on th
 | `protectedPaths` | platform-derived (see below) | Paths that cannot be recursively deleted |
 | `maxDeletesPerWindow` | `20` | Delete commands allowed per window; `0` disables the limit |
 | `windowSeconds` | `60` | Rate-limit window |
+| `allowUntil` | `0` | Epoch milliseconds until which every check is skipped; written by **Allow for 5 minutes** |
+
+## When a call is blocked
+
+The refusal is returned in **both English and Chinese**, whatever the UI language, and it ends with
+what to do next:
+
+```
+dsh-delete-guard blocked this call.
+Assigning to the PowerShell automatic variable $home = is not allowed. …
+dsh-delete-guard 已拦截本次调用。
+不能给 PowerShell 自动变量赋值（$home =）。…
+
+To proceed: use a literal path and confirm it first …
+要继续：改用字面路径并先打印确认 …
+```
+
+Two ways forward, and the message names both:
+
+1. **Change the command** — resolve the target to a literal path and print it first
+   (`Resolve-Path` + `Write-Output`), or point the delete at a concrete subdirectory instead of a
+   protected root.
+2. **Open a five-minute window** — Settings → Delete guard → **Allow for 5 minutes**. Every check is
+   skipped until it expires, the panel shows a live countdown, and the host logs each bypassed call so
+   the window leaves a trace.
+
+![Temporary allow](docs/allow-en.png)
+
+The system prompt tells the agent the same thing: when blocked, explain why and ask you to open the
+window — do not retry with obfuscated variants.
 
 The same values live in the profile's `cordis.patch.yml`:
 

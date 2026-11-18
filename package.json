@@ -1,6 +1,6 @@
 {
   "name": "@voltarenyah/dsh-delete-guard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Delete guard for DeepSeek Harness: blocks automatic-variable assignments, variable delete targets, protected paths, and delete bursts before a shell command runs.",
   "type": "module",
   "main": "./index.mjs",
@@ -66,4 +66,5 @@
   },
   "license": "MIT"
 }
+
 

@@ -59,6 +59,32 @@ dsh plugin --profile <profile> add @voltarenyah/dsh-delete-guard
 | `protectedPaths` | 按平台生成（见下） | 不接受递归删除的路径清单 |
 | `maxDeletesPerWindow` | `20` | 窗口内允许的删除命令数，`0` 关闭 |
 | `windowSeconds` | `60` | 熔断窗口（秒） |
+| `allowUntil` | `0` | 临时放行的截止时间（毫秒时间戳），由「临时放行 5 分钟」写入 |
+
+## 被拦截时
+
+拒绝信息**中英双语**返回，与界面语言无关，末尾直接给出下一步：
+
+```
+dsh-delete-guard blocked this call.
+Assigning to the PowerShell automatic variable $home = is not allowed. …
+dsh-delete-guard 已拦截本次调用。
+不能给 PowerShell 自动变量赋值（$home =）。…
+
+To proceed: …
+要继续：改用字面路径并先打印确认 …
+```
+
+两条出路，文案里都写了：
+
+1. **改命令**——把目标解析成字面路径并先打印（`Resolve-Path` + `Write-Output`），或者把删除指向
+   具体子目录，而不是受保护的那个根。
+2. **开一个 5 分钟窗口**——设置 → 删除闸门 →「临时放行 5 分钟」。到期前跳过全部检查，面板上有
+   实时倒计时，宿主会为每次被放行的调用打一条日志，事后查得到。
+
+![临时放行](docs/allow-zh.png)
+
+系统提示词里也写了同样的规则：被拦时先解释原因、请你开窗口，而不是换个写法硬闯。
 
 同一份配置也写在 profile 的 `cordis.patch.yml`：
 

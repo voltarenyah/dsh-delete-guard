@@ -224,6 +224,26 @@ const cases2 = []
   // 清理放在全部用例之后（见文件末尾），否则执行期用例读不到文件
 }
 
+// 临时放行
+{
+  const bypassed = makeListener({ allowUntil: Date.now() + 60_000 })
+  cases2.push({
+    label: '临时放行生效期间：原本被拒的赋值 → 放行',
+    listener: bypassed,
+    tool: 'pwsh',
+    args: { command: '$home = "C:\\temp\\x"' },
+    expect: 'allow',
+  })
+  const expired = makeListener({ allowUntil: Date.now() - 60_000 })
+  cases2.push({
+    label: '临时放行过期：同一条命令 → 拒绝',
+    listener: expired,
+    tool: 'pwsh',
+    args: { command: '$home = "C:\\temp\\x"' },
+    expect: 'deny',
+  })
+}
+
 let failed = 0
 for (const c of cases) {
   const r = await run(c.listener, c.tool, c.args)

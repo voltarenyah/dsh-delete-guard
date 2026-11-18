@@ -115,6 +115,7 @@ window.__ModuleLoader__.load({
       scanScriptExec: true,
       maxDeletesPerWindow: 20,
       windowSeconds: 60,
+      allowUntil: 0,
     }
 
     const styles = {
@@ -179,6 +180,15 @@ window.__ModuleLoader__.load({
       const protectedPaths = Array.isArray(value.protectedPaths) ? value.protectedPaths : []
       const maxPerWindow = typeof value.maxDeletesPerWindow === 'number' ? value.maxDeletesPerWindow : FULL_DEFAULTS.maxDeletesPerWindow
       const windowSeconds = typeof value.windowSeconds === 'number' ? value.windowSeconds : FULL_DEFAULTS.windowSeconds
+      const allowUntil = typeof value.allowUntil === 'number' ? value.allowUntil : 0
+
+      const [nowTick, setNowTick] = React.useState(Date.now())
+      const bypassLeft = allowUntil - nowTick
+      React.useEffect(function () {
+        if (!(allowUntil > Date.now())) return
+        const timer = setInterval(function () { setNowTick(Date.now()) }, 1000)
+        return function () { clearInterval(timer) }
+      }, [allowUntil])
 
       const write = function (key, next, tag) {
         setError(null)
@@ -331,6 +341,34 @@ window.__ModuleLoader__.load({
                 h('span', { key: 'c' }, t(lang, '秒', 'seconds')),
               ])
             : null,
+        ]),
+
+        h('div', { key: 'allow', style: styles.row }, [
+          h('div', { key: 't', style: { fontWeight: 500, marginBottom: 4 } },
+            t(lang, '临时放行', 'Temporary allow')),
+          h('div', { key: 'd', style: { fontSize: 12, opacity: 0.65, lineHeight: 1.6, marginBottom: 8 } },
+            t(lang,
+              '开启后 5 分钟内跳过全部检查，到点自动失效。只在对某次删除确认过之后使用；被拦下的命令让模型等你开这个窗口再重试。',
+              'Skips every check for 5 minutes, then expires on its own. Use it only after confirming a specific delete; when a command is blocked, tell the agent to retry once you have opened this window.')),
+          bypassLeft > 0
+            ? h('div', { key: 'on', style: { display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 } }, [
+                h('span', { key: 's', style: { color: 'darkorange', fontWeight: 500 } },
+                  t(lang, `放行中，剩余 ${Math.ceil(bypassLeft / 1000)} 秒`, `Allowed — ${Math.ceil(bypassLeft / 1000)}s left`)),
+                h('button', {
+                  key: 'c',
+                  type: 'button',
+                  style: styles.btn,
+                  disabled: busy === 'allow',
+                  onClick: function () { write('allowUntil', 0, 'allow') },
+                }, t(lang, '立即取消', 'Cancel now')),
+              ])
+            : h('button', {
+                key: 'b',
+                type: 'button',
+                style: styles.btn,
+                disabled: busy === 'allow',
+                onClick: function () { write('allowUntil', Date.now() + 5 * 60 * 1000, 'allow') },
+              }, t(lang, '临时放行 5 分钟', 'Allow for 5 minutes')),
         ]),
 
         error ? h('p', { key: 'err', style: styles.err }, t(lang, '保存失败：', 'Save failed: ') + error) : null,

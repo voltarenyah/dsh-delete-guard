@@ -220,6 +220,7 @@ const DEFAULTS = {
   scanScriptExec: true,
   maxDeletesPerWindow: 20,
   windowSeconds: 60,
+  allowUntil: 0,
 }
 
 export const Config = Schema.object({
@@ -237,6 +238,8 @@ export const Config = Schema.object({
     .description('删除熔断阈值：时间窗口内允许的删除类命令数，0 表示关闭'),
   windowSeconds: Schema.number().default(60).volatile()
     .description('删除熔断的时间窗口（秒）'),
+  allowUntil: Schema.number().default(0).volatile()
+    .description('临时放行截止时间（毫秒时间戳，0 表示关闭）；由设置页的「临时放行 5 分钟」写入，到点自动失效'),
 })
 
 /** 递归删除命令的「参数区」：从动词位置到行尾。 */
@@ -327,6 +330,23 @@ function deny(reason) {
   return { kind: 'deny', reason }
 }
 
+const PROCEED_EN = 'To proceed: use a literal path and confirm it first (Resolve-Path + Write-Output). If this delete is what the user asked for, ask them to click "Allow for 5 minutes" in Settings → Delete guard, then retry.'
+const PROCEED_ZH = '要继续：改用字面路径并先打印确认（Resolve-Path + Write-Output）。如果这次删除确实是用户要的，请让用户在「设置 → 删除闸门」点击「临时放行 5 分钟」，然后重试。'
+
+/** 双语拒绝文案：谁看都能懂，不依赖界面语言。 */
+function blocked(en, zh) {
+  return [
+    'dsh-delete-guard blocked this call.',
+    en,
+    '',
+    'dsh-delete-guard 已拦截本次调用。',
+    zh,
+    '',
+    PROCEED_EN,
+    PROCEED_ZH,
+  ].join('\n')
+}
+
 const PROTOCOL_SECTION = `## 删除命令硬约束（dsh-delete-guard）
 
 执行任何删除前先读这三条，违反会被工具层直接拒绝：
@@ -343,6 +363,10 @@ const PROTOCOL_SECTION = `## 删除命令硬约束（dsh-delete-guard）
 4. **不要绕过频率限制**：短时间内连续多次删除会触发熔断，把一次递归删除拆成很多次单个删除同样会被拒绝。
 5. **不要把删除写进脚本文件再执行**：写 \`.ps1\`/\`.sh\`/\`.py\`/\`.js\` 时正文会被扫描，执行脚本前也会读文件检查；
    命中上面任何一条同样被拒绝。需要清理就写一条字面路径的命令，别封装成脚本。
+6. **被拒时不要绕过**：不要为了通过检查去改写命令（换引号、拆字符串、base64 都算绕过）。
+   如果这次删除确实是用户要求的，先向用户说明被拦的原因，请他在「设置 → 删除闸门」点击「临时放行 5 分钟」，然后重试。
+   When blocked, do not work around the check. If the user explicitly asked for that delete, explain why it was
+   blocked and ask them to click "Allow for 5 minutes" in Settings → Delete guard, then retry.
 
 要清理某个构建产物或测试目录时：\`$p = 'C:\\...\\dist'; Get-ChildItem -LiteralPath $p | Measure-Object\`
 先看规模，再 \`Remove-Item -LiteralPath 'C:\\...\\dist' -Recurse -Force\`（字面量，不带变量）。`
@@ -409,12 +433,10 @@ export default {
       if (flag(config, 'blockAutoVarAssignment', true)) {
         const m = ASSIGN_RE.exec(text)
         if (m) {
-          return deny(
-            `dsh-delete-guard 拦截：不能给 PowerShell 自动变量赋值（这里是 ${m[0].trim()}）。` +
-            'PowerShell 变量名大小写不敏感，$home 就是只读的 $HOME（用户主目录）；赋值只报非终止错误，' +
-            '脚本会继续执行，后续命令拿到的仍是主目录。改用 $dshHome / $targetDir / $outDir 这类名字，' +
-            '并在删除前把目标打印出来确认。',
-          )
+          return deny(blocked(
+            `Assigning to the PowerShell automatic variable ${m[0].trim()} is not allowed. Variable names are case-insensitive, so $home is the read-only $HOME (the user home): the assignment raises a non-terminating error, the script keeps running, and later lines still resolve to the home directory. Use $dshHome / $targetDir / $outDir instead.`,
+            `不能给 PowerShell 自动变量赋值（${m[0].trim()}）。变量名大小写不敏感，$home 就是只读的 $HOME（用户主目录）；赋值只报非终止错误，脚本继续执行，后续命令拿到的仍是主目录。改用 $dshHome / $targetDir / $outDir 这类名字。`,
+          ))
         }
       }
 
@@ -424,11 +446,10 @@ export default {
 
       // R2：参数区里带变量
       if (flag(config, 'blockVariableDelete', true) && /[$%]/.test(targetText)) {
-        return deny(
-          'dsh-delete-guard 拦截：递归删除的参数里出现了 `$` 或 `%`（变量/环境变量）。' +
-          '删除目标必须是已证明的字面路径。做法：先用 Resolve-Path -LiteralPath 取值并 Write-Output 打印，' +
-          '确认后对那个字面路径执行删除；不要在同一行里既拼变量又删。',
-        )
+        return deny(blocked(
+          'A recursive delete whose arguments contain `$` or `%` is refused: the target must be a literal path that was actually resolved. Do not build a delete target and delete it in one step.',
+          '递归删除的参数里出现 `$` 或 `%`，拒绝执行：删除目标必须是已解析出来的字面路径，不要在同一行里既拼变量又删。',
+        ))
       }
 
       // R3：受保护路径
@@ -438,11 +459,10 @@ export default {
         if (!target) continue
         const hit = hitsProtected(target, guarded)
         if (hit) {
-          return deny(
-            `dsh-delete-guard 拦截：递归删除的目标 ${target} 是受保护路径（${hit}）本身或它的祖先目录。` +
-            '受保护路径清单可在 设置 → 删除闸门 里调整。如果确实要清理其中某个子目录，' +
-            '请把命令写到那个具体子目录，并在删除前列出将删条目数确认。',
-          )
+          return deny(blocked(
+            `Recursive delete of ${target} is refused: it is a protected path (${hit}) or an ancestor of one. The list is editable in Settings → Delete guard. To clean something inside it, target the concrete subdirectory instead.`,
+            `拒绝递归删除 ${target}：它是受保护路径（${hit}）本身或它的祖先目录。清单可在 设置 → 删除闸门 调整。如果确实要清理其中某个子目录，请把命令写到那个具体子目录。`,
+          ))
         }
       }
 
@@ -454,6 +474,15 @@ export default {
       try {
         if (!exec) return next()
 
+        // 临时放行：用户在设置页手动开的窗口，优先级最高
+        const allowUntil = number(config, 'allowUntil', 0)
+        if (allowUntil > Date.now()) {
+          try {
+            console.warn('[dsh-delete-guard] bypassed by temporary allow until', new Date(allowUntil).toISOString())
+          } catch {}
+          return next()
+        }
+
         // R5：写脚本时扫正文，把「看不见的执行期」提前到「看得见的写入期」
         if (exec.name === 'write' || exec.name === 'edit') {
           if (flag(config, 'scanScriptWrites', true)) {
@@ -462,7 +491,12 @@ export default {
               const body = exec.name === 'write' ? exec.arguments?.content : exec.arguments?.new_string
               if (typeof body === 'string' && body.length > 0) {
                 const verdict = evaluate(body)
-                if (verdict) return deny(`dsh-delete-guard 拦截：脚本正文命中删除规则（${target}）。${verdict.reason}`)
+                if (verdict) {
+                  return deny(
+                    `dsh-delete-guard blocked this call: the script body hits the delete rules (${target}).\n` +
+                    `dsh-delete-guard 已拦截：脚本正文命中删除规则（${target}）。\n\n${verdict.reason}`,
+                  )
+                }
               }
             }
           }
@@ -480,7 +514,12 @@ export default {
             const body = readScriptText(file)
             if (body === null) continue
             const verdict = evaluate(body)
-            if (verdict) return deny(`dsh-delete-guard 拦截：被调用脚本 ${file} 的内容命中删除规则。${verdict.reason}`)
+            if (verdict) {
+              return deny(
+                `dsh-delete-guard blocked this call: the script ${file} hits the delete rules.\n` +
+                `dsh-delete-guard 已拦截：被调用脚本 ${file} 的内容命中删除规则。\n\n${verdict.reason}`,
+              )
+            }
           }
         }
 
@@ -488,11 +527,10 @@ export default {
         if (hasDeleteIntent(text) && tripped()) {
           const max = number(config, 'maxDeletesPerWindow', DEFAULTS.maxDeletesPerWindow)
           const windowSeconds = number(config, 'windowSeconds', DEFAULTS.windowSeconds)
-          return deny(
-            `dsh-delete-guard 拦截：${windowSeconds} 秒内删除类命令已超过 ${max} 次，触发熔断。` +
-            '把一次批量删除拆成很多次单个删除同样会被拒绝。请改用一次明确的批量清理' +
-            '（先 Measure-Object 统计条目数，再对一个具体目录执行一次删除），或等窗口过去。',
-          )
+          return deny(blocked(
+            `More than ${max} delete commands in ${windowSeconds} seconds: the rate limit tripped. Splitting one bulk delete into many single deletes is refused the same way. Do one explicit cleanup (Measure-Object, then a single delete on a concrete directory) or wait for the window.`,
+            `${windowSeconds} 秒内删除类命令超过 ${max} 次，触发熔断。把一次批量删除拆成很多次单个删除同样会被拒绝；请先 Measure-Object 统计条目数，再对一个具体目录执行一次删除，或等窗口过去。`,
+          ))
         }
 
         const verdict = evaluate(text)
