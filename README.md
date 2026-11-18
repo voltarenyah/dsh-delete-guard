@@ -17,6 +17,8 @@ Policy layer, not a sandbox: it decides *whether a command runs*, it does not in
 | **Automatic-variable assignment** | A command assigns to `$home`, `$profile`, `$pwd`, `$input`, `$args`, `$host`, `$pid`, `$error`, `$matches`, `$pshome`, `$PSScriptRoot`, `$LASTEXITCODE`, … | Denied |
 | **Variable delete target** | A recursive delete (`rmdir /s`, `rd /s`, `del /s`, `Remove-Item -Recurse`, `rm -rf`) whose argument region contains `$` or `%` | Denied |
 | **Protected path** | A recursive delete targets a listed path, or an ancestor of one | Denied |
+| **Script body at write time** | Writing a `.ps1`, `.sh`, `.py`, `.js`, `.cmd`, `.bat` file whose content hits any rule above | Denied |
+| **Script body before it runs** | Executing a script through `-File`, `./x.ps1`, `bash x.sh`, `node x.mjs` while its content hits any rule above | Denied |
 | **Delete rate limit** | More delete commands inside the window than the threshold | Denied |
 
 Why the first rule matters: PowerShell variable names are case-insensitive, so `$home` **is** `$HOME`.
@@ -29,6 +31,16 @@ The path rule uses scope proof rather than a keyword blocklist:
 - A listed path and its **ancestors** are protected — deleting an ancestor would take the listed path with it.
 - Anything **below** a listed path is still deletable, so build output and scratch directories keep working.
 - Deleting a path that is not covered does not need an allowlist entry.
+
+Scripts are covered in both directions, because a delete hidden in a `.ps1` never appears on the
+command line:
+
+- **At write time** the `write`/`edit` tools carry the whole file body, so the same rules run over it.
+- **Before execution** a command such as `pwsh -File x.ps1`, `./x.ps1`, `bash x.sh` or `node x.mjs`
+  makes the guard read that file first and apply the same rules.
+
+Both directions use one shared `evaluate()`, so a line that is refused on the command line is refused
+inside a script too — there is no second rule set to drift.
 
 ## Install
 
@@ -48,6 +60,8 @@ Everything is editable from **Settings → Delete guard** and takes effect on th
 |---|---|---|
 | `blockAutoVarAssignment` | `true` | Deny assignments to PowerShell automatic variables |
 | `blockVariableDelete` | `true` | Deny recursive deletes whose arguments contain `$` or `%` |
+| `scanScriptWrites` | `true` | Scan script content when a file is written through the `write`/`edit` tools |
+| `scanScriptExec` | `true` | Read the file and scan it before a script runs |
 | `protectedPaths` | platform-derived (see below) | Paths that cannot be recursively deleted |
 | `maxDeletesPerWindow` | `20` | Delete commands allowed per window; `0` disables the limit |
 | `windowSeconds` | `60` | Rate-limit window |
@@ -100,7 +114,7 @@ Settings. To return to "computed from this machine", delete that `- id: dsh-dele
 
 | Not covered | Why |
 |---|---|
-| Deletes written inside a script file (`.ps1`, `.sh`, `.py`) | The guard only sees the command line |
+| Deletes assembled at run time (base64, `Add-Type` C#, string concatenation, `[IO.File]::Delete`) | Only static text is scanned; the guard does not execute code to find out |
 | Command names assembled in a variable and invoked (`& $cmd`) | Not resolvable from text |
 | Commands split across several inputs in a persistent terminal | Each call sees only its own text |
 | `robocopy /MIR`, `git clean -fdx` and other non-delete verbs | Outside the delete-verb set |

@@ -10,12 +10,28 @@
 // 设计取向：fail-closed 只发生在「删除」这一动作上；其余工具调用一律放行。
 // 守卫自身任何异常都不阻断宿主工具面（catch 后放行）。
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
 const SHELL_TOOLS = new Set(['pwsh', 'powershell', 'bash', 'sh', 'zsh', 'shell', 'terminal', 'terminal_send', 'terminal_write', 'run_command', 'cmd', 'exec'])
+
+/** 会被执行的脚本文件后缀。 */
+const SCRIPT_EXT = /\.(ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs)$/i
+
+/** 命令里出现的脚本路径（带引号或不带，绝对或相对）。 */
+const SCRIPT_TOKEN_RE = /(?:"([^"\r\n]+\.(?:ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs))"|'([^'\r\n]+\.(?:ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs))'|((?:[A-Za-z]:[\\/]|\\\\|\.{1,2}[\\/]|[^\s"'|<>;])[^\s"'|<>;]*\.(?:ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs)))/gi
+
+/** 看起来是在「执行」脚本：`-File x`、`& .\x.ps1`、`bash x.sh`、`cmd /c x.bat`、`node x.mjs`。 */
+const SCRIPT_CALL_RES = [
+  /-file\s+["']?([^"'\s|<>]+\.(?:ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs))["']?/gi,
+  /(?:^|[;&|(\n])\s*(?:&\s*)?["']?((?:[A-Za-z]:[\\/]|\\\\|\.{1,2}[\\/])[^"'\s|<>;]+\.(?:ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs))["']?/gi,
+  /(?:bash|sh|zsh|python|py|node|pwsh|powershell|cmd)(?:\.exe)?\s+(?:\/c\s+)?["']?([^"'\s|<>;]+\.(?:ps1|psm1|sh|bash|zsh|cmd|bat|py|js|mjs|cjs|vbs))["']?/gi,
+]
+
+/** 单个脚本最多读这么多字节；再大的不扫描（避免拖慢工具调用）。 */
+const SCRIPT_SCAN_LIMIT = 256 * 1024
 
 /** PowerShell 自动变量名（大小写不敏感）。 */
 const AUTO_VARS = [
@@ -200,6 +216,8 @@ function defaultProtectedPaths() {
 const DEFAULTS = {
   blockAutoVarAssignment: true,
   blockVariableDelete: true,
+  scanScriptWrites: true,
+  scanScriptExec: true,
   maxDeletesPerWindow: 20,
   windowSeconds: 60,
 }
@@ -209,6 +227,10 @@ export const Config = Schema.object({
     .description('拒绝给 PowerShell 自动变量赋值（$home/$profile/$pwd/$args/$host/$pid…）'),
   blockVariableDelete: Schema.boolean().default(true).volatile()
     .description('递归删除（rmdir /s、rd /s、del /s、Remove-Item -Recurse、rm -rf）的参数里出现 $ 或 % 时拒绝'),
+  scanScriptWrites: Schema.boolean().default(true).volatile()
+    .description('写入 .ps1/.sh/.py/.js/.cmd/.bat 等脚本时，用同一套规则扫描正文；命中则拒绝写入'),
+  scanScriptExec: Schema.boolean().default(true).volatile()
+    .description('执行脚本（-File、./x.ps1、bash x.sh、node x.mjs 等）前读取文件内容，用同一套规则扫描；命中则拒绝执行'),
   protectedPaths: Schema.array(Schema.string()).default(defaultProtectedPaths()).volatile()
     .description('受保护路径：清单中的路径本身及其祖先不接受递归删除，其下的子路径可以删除'),
   maxDeletesPerWindow: Schema.number().default(20).volatile()
@@ -264,6 +286,43 @@ function hitsProtected(target, protectedList) {
   return null
 }
 
+/** 读脚本正文；读不到、不是文件、或超过上限时返回 null。 */
+function readScriptText(filePath) {
+  try {
+    const info = statSync(filePath)
+    if (!info.isFile() || info.size > SCRIPT_SCAN_LIMIT) return null
+    return readFileSync(filePath, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+/** 命令里被「执行」的脚本，解析成绝对路径并去重（最多 5 个）。 */
+function scriptPathsOf(text) {
+  const out = []
+  const seen = new Set()
+  for (const re of SCRIPT_CALL_RES) {
+    re.lastIndex = 0
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const raw = (m[1] || '').trim()
+      if (!raw || /[$%]/.test(raw)) continue
+      let abs
+      try {
+        abs = resolve(raw)
+      } catch {
+        continue
+      }
+      const key = abs.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(abs)
+      if (out.length >= 5) return out
+    }
+  }
+  return out
+}
+
 function deny(reason) {
   return { kind: 'deny', reason }
 }
@@ -282,6 +341,8 @@ const PROTOCOL_SECTION = `## 删除命令硬约束（dsh-delete-guard）
    （Desktop/Documents/Downloads/Pictures/Videos/Music/OneDrive）、\`SystemRoot\`、\`Program Files\`、
    \`DSH_HOME\`。这些路径本身与它们的祖先都不能被递归删除；它们下面的具体子目录可以删。
 4. **不要绕过频率限制**：短时间内连续多次删除会触发熔断，把一次递归删除拆成很多次单个删除同样会被拒绝。
+5. **不要把删除写进脚本文件再执行**：写 \`.ps1\`/\`.sh\`/\`.py\`/\`.js\` 时正文会被扫描，执行脚本前也会读文件检查；
+   命中上面任何一条同样被拒绝。需要清理就写一条字面路径的命令，别封装成脚本。
 
 要清理某个构建产物或测试目录时：\`$p = 'C:\\...\\dist'; Get-ChildItem -LiteralPath $p | Measure-Object\`
 先看规模，再 \`Remove-Item -LiteralPath 'C:\\...\\dist' -Recurse -Force\`（字面量，不带变量）。`
@@ -391,10 +452,37 @@ export default {
 
     ctx.on('tools/pre-execute', async (exec, next) => {
       try {
-        if (!exec || !SHELL_TOOLS.has(exec.name)) return next()
+        if (!exec) return next()
+
+        // R5：写脚本时扫正文，把「看不见的执行期」提前到「看得见的写入期」
+        if (exec.name === 'write' || exec.name === 'edit') {
+          if (flag(config, 'scanScriptWrites', true)) {
+            const target = exec.arguments?.file_path || exec.arguments?.path
+            if (typeof target === 'string' && SCRIPT_EXT.test(target)) {
+              const body = exec.name === 'write' ? exec.arguments?.content : exec.arguments?.new_string
+              if (typeof body === 'string' && body.length > 0) {
+                const verdict = evaluate(body)
+                if (verdict) return deny(`dsh-delete-guard 拦截：脚本正文命中删除规则（${target}）。${verdict.reason}`)
+              }
+            }
+          }
+          return next()
+        }
+
+        if (!SHELL_TOOLS.has(exec.name)) return next()
         const texts = collectStrings(exec.arguments ?? {}, [])
         if (texts.length === 0) return next()
         const text = texts.join('\n')
+
+        // R6：执行脚本前读文件，用同一套规则扫描
+        if (flag(config, 'scanScriptExec', true)) {
+          for (const file of scriptPathsOf(text)) {
+            const body = readScriptText(file)
+            if (body === null) continue
+            const verdict = evaluate(body)
+            if (verdict) return deny(`dsh-delete-guard 拦截：被调用脚本 ${file} 的内容命中删除规则。${verdict.reason}`)
+          }
+        }
 
         // R4：每次删除类命令计数一次（被拒也计入），超阈值直接熔断
         if (hasDeleteIntent(text) && tripped()) {

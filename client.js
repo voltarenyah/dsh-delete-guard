@@ -92,11 +92,27 @@ window.__ModuleLoader__.load({
         zhDesc: '递归删除（rmdir /s、rd /s、del /s、Remove-Item -Recurse、rm -rf）的参数里出现 $ 或 % 时拒绝，要求先用字面路径确认目标。',
         enDesc: 'Refuse rmdir /s, rd /s, del /s, Remove-Item -Recurse or rm -rf when the arguments contain $ or %, requiring a literal path instead.',
       },
+      {
+        key: 'scanScriptWrites',
+        zh: '写入脚本时检查正文',
+        en: 'Scan scripts when writing them',
+        zhDesc: '写入 .ps1、.sh、.py、.js、.cmd、.bat 等脚本时，用上面同一套规则扫描内容；命中则拒绝写入，把执行期看不见的问题提前到写入期。',
+        enDesc: 'When writing .ps1, .sh, .py, .js, .cmd or .bat files, scan the content with the same rules; a hit is refused at write time, where the guard can actually see it.',
+      },
+      {
+        key: 'scanScriptExec',
+        zh: '执行脚本前检查内容',
+        en: 'Scan scripts before running them',
+        zhDesc: '执行 -File、./x.ps1、bash x.sh、node x.mjs 等时，先读取该文件再按同一套规则判定；命中的脚本不会被执行。',
+        enDesc: 'Before running a script via -File, ./x.ps1, bash x.sh, node x.mjs and similar, read the file and apply the same rules; a hit is not executed.',
+      },
     ]
 
     const FULL_DEFAULTS = {
       blockAutoVarAssignment: true,
       blockVariableDelete: true,
+      scanScriptWrites: true,
+      scanScriptExec: true,
       maxDeletesPerWindow: 20,
       windowSeconds: 60,
     }

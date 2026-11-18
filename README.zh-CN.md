@@ -16,6 +16,8 @@
 | **自动变量赋值** | 命令给 `$home` `$profile` `$pwd` `$input` `$args` `$host` `$pid` `$error` `$matches` `$pshome` `$PSScriptRoot` `$LASTEXITCODE` 等赋值 | 拒绝 |
 | **变量删除目标** | 递归删除（`rmdir /s`、`rd /s`、`del /s`、`Remove-Item -Recurse`、`rm -rf`）的参数区出现 `$` 或 `%` | 拒绝 |
 | **受保护路径** | 递归删除的目标是清单中的路径，或清单中某个路径的祖先 | 拒绝 |
+| **写入脚本时扫正文** | 写 `.ps1`、`.sh`、`.py`、`.js`、`.cmd`、`.bat` 时，正文命中上面任一规则 | 拒绝写入 |
+| **执行脚本前扫正文** | 通过 `-File`、`./x.ps1`、`bash x.sh`、`node x.mjs` 执行脚本，内容命中上面任一规则 | 拒绝执行 |
 | **删除频率熔断** | 窗口内的删除类命令超过阈值 | 拒绝 |
 
 第一条为什么必要：PowerShell 变量名大小写不敏感，`$home` **就是** `$HOME`。给它赋值是**非终止错误**，
@@ -26,6 +28,14 @@
 - 清单中的路径及其**祖先**受保护——删祖先会连带删掉清单项；
 - 清单路径**下面**的子目录照常可删，构建产物、临时目录不受影响；
 - 未被覆盖的路径不需要额外加白名单。
+
+脚本两个方向都覆盖——藏在 `.ps1` 里的删除不会出现在命令行上：
+
+- **写入时**：`write`/`edit` 工具的参数里就有完整正文，同一套规则直接跑一遍；
+- **执行前**：命令里出现 `pwsh -File x.ps1`、`./x.ps1`、`bash x.sh`、`node x.mjs` 时，
+  守卫先读这个文件，再按同一套规则判定。
+
+两个方向共用同一个 `evaluate()`，所以"命令行里被拒的写法"在脚本里也一定被拒，不存在两套规则漂移。
 
 ## 安装
 
@@ -44,6 +54,8 @@ dsh plugin --profile <profile> add @voltarenyah/dsh-delete-guard
 |---|---|---|
 | `blockAutoVarAssignment` | `true` | 拒绝给 PowerShell 自动变量赋值 |
 | `blockVariableDelete` | `true` | 递归删除参数里出现 `$` 或 `%` 时拒绝 |
+| `scanScriptWrites` | `true` | 通过 `write`/`edit` 写脚本文件时扫描正文 |
+| `scanScriptExec` | `true` | 执行脚本前读取文件内容再判定 |
 | `protectedPaths` | 按平台生成（见下） | 不接受递归删除的路径清单 |
 | `maxDeletesPerWindow` | `20` | 窗口内允许的删除命令数，`0` 关闭 |
 | `windowSeconds` | `60` | 熔断窗口（秒） |
@@ -93,7 +105,7 @@ dsh plugin --profile <profile> add @voltarenyah/dsh-delete-guard
 
 | 不覆盖 | 原因 |
 |---|---|
-| 写在脚本文件（`.ps1`、`.sh`、`.py`）里的删除 | 守卫只看到命令行文本 |
+| 运行时拼出来的删除（base64、`Add-Type` 里的 C#、字符串拼接、`[IO.File]::Delete`） | 只扫静态文本，不会为了判定去执行代码 |
 | 命令名先拼进变量再调用（`& $cmd`） | 文本层面无法求值 |
 | 持久终端里分多次输入拼出的命令 | 每次只看本次文本 |
 | `robocopy /MIR`、`git clean -fdx` 等非删除动词的批量删除 | 不在删除动词集合内 |

@@ -143,6 +143,87 @@ cases.push(
   },
 )
 
+const cases2 = []
+
+// 脚本扫描：写入期 + 执行期
+{
+  const w = makeListener()
+  cases2.push({
+    label: '写 .ps1：正文含自动变量赋值 → 拒绝',
+    listener: w,
+    tool: 'write',
+    args: { file_path: 'C:\\tmp\\clean.ps1', content: '$home = "C:\\x"\nRemove-Item -Recurse "$home"' },
+    expect: 'deny',
+  })
+  cases2.push({
+    label: '写 .ps1：正文含变量目标的递归删除 → 拒绝',
+    listener: w,
+    tool: 'write',
+    args: { file_path: 'C:\\tmp\\build.ps1', content: 'Remove-Item -Recurse -Force $scratch' },
+    expect: 'deny',
+  })
+  cases2.push({
+    label: '写 .ps1：普通内容 → 放行',
+    listener: w,
+    tool: 'write',
+    args: { file_path: 'C:\\tmp\\ok.ps1', content: 'Write-Output "hello"\nGet-ChildItem .' },
+    expect: 'allow',
+  })
+  cases2.push({
+    label: '写 .md：正文含删除字样 → 放行（非脚本）',
+    listener: w,
+    tool: 'write',
+    args: { file_path: 'C:\\tmp\\notes.md', content: 'Remove-Item -Recurse -Force $scratch' },
+    expect: 'allow',
+  })
+}
+
+{
+  const { writeFileSync, mkdirSync, rmSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const dir = join(tmpdir(), 'dsh-guard-scan-test')
+  mkdirSync(dir, { recursive: true })
+  const bad = join(dir, 'bad.ps1')
+  const good = join(dir, 'good.ps1')
+  writeFileSync(bad, 'Remove-Item -Recurse -Force $target\n', 'utf8')
+  writeFileSync(good, 'Write-Output "ok"\n', 'utf8')
+
+  const e = makeListener()
+  cases2.push({
+    label: '执行脚本：-File 指向含变量删除的脚本 → 拒绝',
+    listener: e,
+    tool: 'pwsh',
+    args: { command: `pwsh -NoProfile -File "${bad}"` },
+    expect: 'deny',
+  })
+  cases2.push({
+    label: '执行脚本：-File 指向干净脚本 → 放行',
+    listener: e,
+    tool: 'pwsh',
+    args: { command: `pwsh -NoProfile -File "${good}"` },
+    expect: 'allow',
+  })
+  cases2.push({
+    label: '只读取脚本（Get-Content）→ 放行',
+    listener: e,
+    tool: 'pwsh',
+    args: { command: `Get-Content -LiteralPath "${bad}"` },
+    expect: 'allow',
+  })
+
+  const off = makeListener({ scanScriptExec: false, scanScriptWrites: false })
+  cases2.push({
+    label: '关闭脚本扫描后：执行同一脚本 → 放行',
+    listener: off,
+    tool: 'pwsh',
+    args: { command: `pwsh -NoProfile -File "${bad}"` },
+    expect: 'allow',
+  })
+
+  // 清理放在全部用例之后（见文件末尾），否则执行期用例读不到文件
+}
+
 let failed = 0
 for (const c of cases) {
   const r = await run(c.listener, c.tool, c.args)
@@ -154,7 +235,6 @@ for (const c of cases) {
 }
 
 // 跨平台/异常路径：只验证判定结果，监听器不会真的执行命令
-const cases2 = []
 {
   const tilde = makeListener()
   cases2.push({ label: '`rm -rf ~` 命中用户主目录', listener: tilde, tool: 'bash', args: { command: 'rm -rf ~' }, expect: 'deny' })
@@ -203,4 +283,12 @@ if (!offOk) failed++
 console.log(`${offOk ? 'PASS' : 'FAIL'}  熔断关闭（0）：8 次均放行`)
 
 console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`)
+
+try {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  fs.rmSync(path.join(os.tmpdir(), 'dsh-guard-scan-test'), { recursive: true, force: true })
+} catch {}
+
 process.exit(failed === 0 ? 0 : 1)
