@@ -11,8 +11,8 @@ Policy layer, not a sandbox: it decides *whether a command runs*, it does not in
 
 ![Delete guard settings page](docs/settings-en.png)
 
-> The screenshot is from 1.3.1; 1.4.0 adds "Delete audit log" and "Windows shadow copies" cards
-> below the rate-limit section.
+> The screenshots show the top of the page; the "Delete audit log" and "Windows shadow copies" cards
+> sit below the rate-limit section.
 
 ## What it blocks
 
