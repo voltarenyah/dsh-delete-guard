@@ -1,7 +1,7 @@
 {
   "name": "@voltarenyah/dsh-delete-guard",
-  "version": "1.3.1",
-  "description": "Delete guard for DeepSeek Harness: blocks automatic-variable assignments, variable delete targets, protected paths, and delete bursts before a shell command runs.",
+  "version": "1.4.1",
+  "description": "Delete guard for DeepSeek Harness: blocks automatic-variable assignments, variable delete targets, protected paths, and delete bursts before a shell command runs, and keeps a local audit log of recursive and blocked delete calls.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -43,6 +43,7 @@
     "guard",
     "protected-paths",
     "rate-limit",
+    "audit-log",
     "safety",
     "windows",
     "macos",
@@ -66,6 +67,8 @@
   },
   "license": "MIT"
 }
+
+
 
 
 

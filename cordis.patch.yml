@@ -7,6 +7,9 @@
 #       protectedPaths: ['D:\Projects\keep']
 #       maxDeletesPerWindow: 20
 #       windowSeconds: 60
+#       auditLog: true
+#       auditRetentionDays: 30
+#       auditDir: 'C:\Users\me\.dsh\delete-guard\audit'
 # 设置页（设置 → 删除闸门）写的是同一处配置。
 - insert:
     - id: dsh-delete-guard

@@ -12,6 +12,9 @@ window.__ModuleLoader__.load({
 
     const DEFAULT_LOCALE = (typeof navigator !== 'undefined' && String(navigator.language || '').toLowerCase().startsWith('zh')) ? 'zh' : 'en'
 
+    /** 卷影副本提示只在 Windows 客户端显示；宿主是否同机由文案说明。 */
+    const IS_WINDOWS = typeof navigator !== 'undefined' && /Windows/i.test(String(navigator.userAgent || ''))
+
     /**
      * 宿主在切语言时会同步 <html lang>（例如 zh-CN），这里直接读它，
      * 不依赖 locale 服务快照的内部字段名。读不到时退回浏览器语言。
@@ -115,6 +118,9 @@ window.__ModuleLoader__.load({
       scanScriptExec: true,
       maxDeletesPerWindow: 20,
       windowSeconds: 60,
+      auditLog: true,
+      auditRetentionDays: 30,
+      auditDir: '',
     }
 
     const styles = {
@@ -130,6 +136,9 @@ window.__ModuleLoader__.load({
       btn: { fontSize: 12, padding: '4px 10px', border: '1px solid rgba(127,127,127,0.4)', borderRadius: 4, background: 'transparent', color: 'inherit', cursor: 'pointer' },
       err: { marginTop: 8, fontSize: 12, color: 'crimson' },
       num: { width: 64, fontSize: 12, padding: '4px 6px', border: '1px solid rgba(127,127,127,0.35)', borderRadius: 4, background: 'transparent', color: 'inherit' },
+      path: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, padding: '2px 6px', border: '1px solid rgba(127,127,127,0.28)', borderRadius: 4, background: 'rgba(127,127,127,0.08)', wordBreak: 'break-all' },
+      smallBtn: { fontSize: 11, padding: '2px 8px', border: '1px solid rgba(127,127,127,0.4)', borderRadius: 4, background: 'transparent', color: 'inherit', cursor: 'pointer', flex: '0 0 auto' },
+      line: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, lineHeight: 1.5 },
     }
 
     function useLocale(locale) {
@@ -148,17 +157,60 @@ window.__ModuleLoader__.load({
       )
     }
 
+    const ON_COLOR = 'var(--dsw-static-deepseek-400, #4d6bfe)'
+    const OFF_COLOR = 'var(--dsw-alias-border-l4, rgba(127,127,127,0.45))'
+    const DIM_COLOR = 'var(--dsw-alias-label-primary-dimmed, rgba(127,127,127,0.9))'
+
+    /** iOS 风格开关：36×20 胶囊 + 可滑动圆点。 */
+    function Toggle(props) {
+      const on = !!props.on
+      const disabled = !!props.disabled
+      return h('button', {
+        type: 'button',
+        role: 'switch',
+        'aria-checked': on,
+        'aria-label': props.label || '',
+        disabled: disabled,
+        onClick: function () { if (!disabled) props.onChange(!on) },
+        style: {
+          flex: '0 0 auto',
+          position: 'relative',
+          width: 36,
+          height: 20,
+          padding: 0,
+          border: 'none',
+          borderRadius: 10,
+          background: on ? ON_COLOR : OFF_COLOR,
+          cursor: disabled ? 'default' : 'pointer',
+          opacity: disabled ? 0.5 : 1,
+          transition: 'background 140ms ease',
+        },
+      }, h('span', {
+        style: {
+          position: 'absolute',
+          top: 2,
+          left: on ? 18 : 2,
+          width: 16,
+          height: 16,
+          borderRadius: '50%',
+          background: '#fff',
+          boxShadow: '0 1px 2px rgba(0,0,0,0.3)',
+          transition: 'left 140ms ease',
+        },
+      }))
+    }
+
     function SwitchRow(props) {
       const field = props.field
       const lang = props.lang
       return h('div', { style: styles.row }, [
-        h('label', { key: 'l', style: styles.label }, [
-          h('input', {
-            key: 'i',
-            type: 'checkbox',
-            checked: props.on,
+        h('div', { key: 'l', style: { display: 'flex', alignItems: 'center', gap: 10 } }, [
+          h(Toggle, {
+            key: 'sw',
+            on: props.on,
             disabled: props.disabled,
-            onChange: function (e) { props.onChange(e.target.checked) },
+            label: t(lang, field.zh, field.en),
+            onChange: props.onChange,
           }),
           h('span', { key: 't', style: { fontWeight: 500 } }, t(lang, field.zh, field.en)),
         ]),
@@ -173,6 +225,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState(null)
       const [busy, setBusy] = React.useState(null)
       const [draft, setDraft] = React.useState('')
+      const [copied, setCopied] = React.useState(null)
 
       const value = (snap && snap.value) || {}
       const effective = (key) => (typeof value[key] === 'boolean' ? value[key] : FULL_DEFAULTS[key])
@@ -186,6 +239,11 @@ window.__ModuleLoader__.load({
         .filter(Boolean)
       const maxPerWindow = typeof value.maxDeletesPerWindow === 'number' ? value.maxDeletesPerWindow : FULL_DEFAULTS.maxDeletesPerWindow
       const windowSeconds = typeof value.windowSeconds === 'number' ? value.windowSeconds : FULL_DEFAULTS.windowSeconds
+      const auditOn = typeof value.auditLog === 'boolean' ? value.auditLog : FULL_DEFAULTS.auditLog
+      const auditRetention = typeof value.auditRetentionDays === 'number' ? value.auditRetentionDays : FULL_DEFAULTS.auditRetentionDays
+      const configuredAuditDir = typeof value.auditDir === 'string' ? value.auditDir.trim() : ''
+      const auditDirLabel = configuredAuditDir
+        || t(lang, '$DSH_HOME/delete-guard/audit（通常是 ~/.dsh/delete-guard/audit）', '$DSH_HOME/delete-guard/audit (usually ~/.dsh/delete-guard/audit)')
 
       const write = function (key, next, tag) {
         setError(null)
@@ -193,6 +251,20 @@ window.__ModuleLoader__.load({
         return Promise.resolve(form.set(key, next))
           .catch(function (e) { setError(String((e && e.message) || e)) })
           .then(function () { setBusy(null) })
+      }
+
+      const copy = function (key, text) {
+        setCopied(null)
+        try {
+          Promise.resolve(navigator.clipboard.writeText(text))
+            .then(function () {
+              setCopied(key)
+              setTimeout(function () { setCopied(null) }, 1500)
+            })
+            .catch(function () { setCopied('error') })
+        } catch (e) {
+          setCopied('error')
+        }
       }
 
       const addPath = function () {
@@ -241,8 +313,8 @@ window.__ModuleLoader__.load({
         h('h3', { key: 'h', style: styles.h3 }, t(lang, '删除闸门', 'Delete guard')),
         h('p', { key: 'i', style: styles.intro },
           t(lang,
-            '在 shell 工具执行前检查删除命令：拦下未展开的变量目标、受保护路径，以及短时间内的批量删除。改动即时生效。',
-            'Checks delete commands before a shell tool runs: unexpanded variable targets, protected paths, and bursts of deletions. Changes apply immediately.',
+            '在 shell 工具执行前检查删除命令：拦下未展开的变量目标、受保护路径，以及短时间内的批量删除；删除相关调用会写入审计日志。改动即时生效。',
+            'Checks delete commands before a shell tool runs: unexpanded variable targets, protected paths, and bursts of deletions; delete-related calls are written to an audit log. Changes apply immediately.',
           )),
 
         h('div', { key: 'switches' }, SWITCHES.map((field) => h(SwitchRow, {
@@ -259,22 +331,29 @@ window.__ModuleLoader__.load({
             t(lang, '受保护路径', 'Protected paths')),
           h('div', { key: 'desc', style: { fontSize: 12, opacity: 0.65, lineHeight: 1.6 } },
             t(lang,
-              '清单中的路径本身、以及它们的祖先目录都不接受递归删除；它们下面的子目录仍然可以删除。祖先目录自动包含，不需要单独添加。每条前面的勾选可以单独停用该条保护，停用后此路径不再受保护。',
-              'A listed path and its ancestors cannot be recursively deleted; anything below a listed path still can. Ancestors are included automatically. The checkbox in front of each entry switches that single entry off.',
+              '清单中的路径本身、以及它们的祖先目录都不接受递归删除；它们下面的子目录仍然可以删除。祖先目录自动包含，不需要单独添加。每条前面的开关可以单独停用该条保护，停用后文字变灰并加删除线。',
+              'A listed path and its ancestors cannot be recursively deleted; anything below a listed path still can. Ancestors are included automatically. The switch in front of each entry turns that single entry off; a disabled entry is greyed out and struck through.',
             )),
           h('ul', { key: 'list', style: styles.list }, protectedPaths.map((entry) => h('li', {
             key: entry.path,
-            style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', opacity: entry.enabled ? 1 : 0.45 },
+            style: { display: 'flex', alignItems: 'center', gap: 10, fontSize: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
           }, [
-            h('input', {
+            h(Toggle, {
               key: 'on',
-              type: 'checkbox',
-              checked: entry.enabled,
+              on: entry.enabled,
               disabled: busy === 'paths',
-              title: t(lang, '启用这条保护', 'Enable this entry'),
-              onChange: function (e) { togglePath(entry.path, e.target.checked) },
+              label: entry.path,
+              onChange: function (next) { togglePath(entry.path, next) },
             }),
-            h('span', { key: 'p', style: { flex: 1, wordBreak: 'break-all' } }, entry.path),
+            h('span', {
+              key: 'p',
+              style: {
+                flex: 1,
+                wordBreak: 'break-all',
+                color: entry.enabled ? 'inherit' : DIM_COLOR,
+                textDecoration: entry.enabled ? 'none' : 'line-through',
+              },
+            }, entry.path),
             h('button', {
               key: 'x',
               type: 'button',
@@ -356,6 +435,89 @@ window.__ModuleLoader__.load({
               ])
             : null,
         ]),
+
+        h('div', { key: 'audit', style: styles.row }, [
+          h('label', { key: 'l', style: styles.label }, [
+            h('input', {
+              key: 'i',
+              type: 'checkbox',
+              checked: auditOn,
+              disabled: busy === 'audit',
+              onChange: function (e) { write('auditLog', e.target.checked, 'audit') },
+            }),
+            h('span', { key: 't', style: { fontWeight: 500 } }, t(lang, '删除审计日志', 'Delete audit log')),
+          ]),
+          h('div', { key: 'd', style: styles.desc },
+            t(lang,
+              '默认记录递归删除（放行与拦截）以及所有被拦截的调用；普通的非递归删除不记录。日志按天一个 JSONL 文件。',
+              'Recursive deletes (allowed and blocked) and every blocked call are recorded; ordinary non-recursive deletes are not. One JSONL file per day.',
+            )),
+          auditOn
+            ? h('div', { key: 'body', style: { marginLeft: 24, marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 } }, [
+                h('div', { key: 'path', style: styles.line }, [
+                  h('span', { key: 'k', style: { opacity: 0.65 } }, t(lang, '目录：', 'Directory: ')),
+                  h('code', { key: 'v', style: styles.path }, auditDirLabel),
+                  configuredAuditDir
+                    ? h('button', {
+                        key: 'c',
+                        type: 'button',
+                        style: styles.smallBtn,
+                        onClick: function () { copy('audit-path', configuredAuditDir) },
+                      }, copied === 'audit-path' ? t(lang, '已复制', 'Copied') : t(lang, '复制', 'Copy'))
+                    : null,
+                ]),
+                h('div', { key: 'ret', style: styles.line }, [
+                  h('span', { key: 'a' }, t(lang, '保留', 'Keep')),
+                  h('input', {
+                    key: 'n',
+                    type: 'number',
+                    min: 0,
+                    value: auditRetention,
+                    style: styles.num,
+                    disabled: busy === 'audit',
+                    onChange: function (e) {
+                      const n = parseInt(e.target.value, 10)
+                      if (Number.isFinite(n) && n >= 0) write('auditRetentionDays', n, 'audit')
+                    },
+                  }),
+                  h('span', { key: 'b' }, t(lang, '天（0 表示不自动清理）', 'days (0 keeps forever)')),
+                ]),
+                h('div', { key: 'warn', style: { fontSize: 12, opacity: 0.65, lineHeight: 1.5 } },
+                  t(lang,
+                    '日志只记录调用，不保存文件内容；命令原文可能包含敏感信息。恢复仍需卷影副本或备份。',
+                    'The log records calls, not file contents; commands may contain sensitive text. Recovery still needs a shadow copy or backup.',
+                  )),
+                copied === 'error'
+                  ? h('div', { key: 'copyerr', style: styles.err }, t(lang, '复制失败，请手动选中路径。', 'Copy failed; select the path manually.'))
+                  : null,
+              ])
+            : null,
+        ]),
+
+        IS_WINDOWS
+          ? h('div', { key: 'vss', style: styles.row }, [
+              h('div', { key: 't', style: { fontWeight: 500, marginBottom: 4 } }, t(lang, 'Windows 卷影副本', 'Windows shadow copies')),
+              h('div', { key: 'd', style: { fontSize: 12, opacity: 0.65, lineHeight: 1.6 } },
+                t(lang,
+                  'DSH 不会自动读取卷影副本时间（需要管理员权限）。要查看上次存档时间，请在“以管理员身份运行”的 PowerShell 中执行：',
+                  'DSH does not read shadow-copy times automatically (administrator required). To see the last snapshot, run this in an elevated PowerShell:',
+                )),
+              h('div', { key: 'cmd', style: { marginLeft: 24, marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+                h('code', { key: 'c', style: styles.path }, 'vssadmin list shadows'),
+                h('button', {
+                  key: 'b',
+                  type: 'button',
+                  style: styles.smallBtn,
+                  onClick: function () { copy('vss-cmd', 'vssadmin list shadows') },
+                }, copied === 'vss-cmd' ? t(lang, '已复制', 'Copied') : t(lang, '复制', 'Copy')),
+              ]),
+              h('div', { key: 'w', style: { marginLeft: 24, marginTop: 6, fontSize: 12, opacity: 0.65, lineHeight: 1.5 } },
+                t(lang,
+                  '卷影副本不等于完整备份；系统保护主要覆盖系统文件。命令要在宿主机上运行。',
+                  'A shadow copy is not a full backup; System Protection mainly covers system files. Run the command on the host machine.',
+                )),
+            ])
+          : null,
 
         error ? h('p', { key: 'err', style: styles.err }, t(lang, '保存失败：', 'Save failed: ') + error) : null,
       ])

@@ -1,24 +1,40 @@
 // 离线自测：用假 ctx 捕获 tools/pre-execute 监听器，逐条断言。
 import plugin from './index.mjs'
 
-function makeListener(config = {}) {
+function makeListeners(config = {}) {
   const listeners = []
   const ctx = {
     on(event, fn) { listeners.push({ event, fn }) },
     get() { return null },
     effect(fn) { try { fn() } catch {} },
   }
-  plugin.apply(ctx, config)
-  return listeners.find((l) => l.event === 'tools/pre-execute').fn
+  // 默认关掉审计，避免离线测试往真实 $DSH_HOME 写日志；审计用例显式打开。
+  plugin.apply(ctx, { auditLog: false, ...config })
+  return {
+    pre: listeners.find((l) => l.event === 'tools/pre-execute')?.fn,
+    result: listeners.find((l) => l.event === 'tools/result')?.fn,
+  }
 }
 
+function makeListener(config = {}) {
+  return makeListeners(config).pre
+}
+
+let callSeq = 0
 async function run(listener, tool, args) {
   let allowed = false
-  const res = await listener({ name: tool, arguments: args }, async () => {
+  callSeq += 1
+  const exec = {
+    name: tool,
+    arguments: args,
+    callId: `test-call-${callSeq}`,
+    rootCallId: `test-call-${callSeq}`,
+  }
+  const res = await listener(exec, async () => {
     allowed = true
     return { kind: 'allow' }
   })
-  return { denied: res?.kind === 'deny', allowed, reason: res?.reason ?? '' }
+  return { denied: res?.kind === 'deny', allowed, reason: res?.reason ?? '', exec }
 }
 
 const main = makeListener()
@@ -273,7 +289,7 @@ for (const c of cases) {
 
   // 显式清空 → 用户明确要求不做路径保护
   const empty = makeListener({ protectedPaths: [] })
-  cases2.push({ label: '显式空清单 → 不做路径保护（放行）', listener: empty, tool: 'pwsh', args: { command: "Remove-Item -LiteralPath 'C:\\Users\\Ansel' -Recurse -Force" }, expect: 'allow' })
+  cases2.push({ label: '显式空清单 → 不做路径保护（放行）', listener: empty, tool: 'pwsh', args: { command: "Remove-Item -LiteralPath 'C:\\Users\\Ansel\\AppData\\Local\\Temp\\empty-list-probe' -Recurse -Force" }, expect: 'allow' })
 
   // Windows 上 `/s` 这类开关不会被误认成路径
   const flags = makeListener({ protectedPaths: ['C:\\Data'] })
@@ -309,6 +325,152 @@ for (let i = 0; i < 8; i++) {
 const offOk = !anyDenied
 if (!offOk) failed++
 console.log(`${offOk ? 'PASS' : 'FAIL'}  熔断关闭（0）：8 次均放行`)
+
+// ---- 审计日志 -------------------------------------------------------------
+{
+  const auditFs = await import('node:fs')
+  const auditOs = await import('node:os')
+  const auditPath = await import('node:path')
+  const auditRoot = auditFs.mkdtempSync(auditPath.join(auditOs.tmpdir(), 'dsh-guard-audit-'))
+  const auditDir = auditPath.join(auditRoot, 'audit')
+  const auditCfg = { auditLog: true, auditDir, auditRetentionDays: 30 }
+
+  const readAudit = () => {
+    let files = []
+    try { files = auditFs.readdirSync(auditDir) } catch { return [] }
+    const records = []
+    for (const name of files) {
+      if (!name.endsWith('.jsonl')) continue
+      let text = ''
+      try { text = auditFs.readFileSync(auditPath.join(auditDir, name), 'utf8') } catch { continue }
+      for (const line of text.split(/\r?\n/)) {
+        if (!line) continue
+        try { records.push(JSON.parse(line)) } catch {}
+      }
+    }
+    return records
+  }
+  const checkAudit = (ok, label) => {
+    if (!ok) failed++
+    console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}`)
+  }
+
+  // 1. 拦截的递归删除：R3 + targets
+  {
+    const protectedDir = auditFs.mkdtempSync(auditPath.join(auditOs.tmpdir(), 'dsh-guard-protected-'))
+    const { pre } = makeListeners({ ...auditCfg, protectedPaths: [protectedDir] })
+    const cmd = "Remove-Item -LiteralPath '" + protectedDir + "' -Recurse -Force"
+    const r = await run(pre, 'pwsh', { command: cmd })
+    const rec = readAudit().find((x) => x.event === 'delete-intent' && x.rule === 'R3')
+    checkAudit(r.denied && !!rec && rec.verdict === 'blocked' && rec.targets.length > 0, '审计：拦截的递归删除记录 R3 + 目标')
+  }
+
+  // 2. 放行的递归删除：allowed + recursive
+  {
+    const target = auditPath.join(auditRoot, 'allowed-probe')
+    auditFs.mkdirSync(target, { recursive: true })
+    const { pre } = makeListeners(auditCfg)
+    const cmd = "Remove-Item -LiteralPath '" + target + "' -Recurse -Force"
+    await run(pre, 'pwsh', { command: cmd })
+    const rec = readAudit().find((x) => x.event === 'delete-intent' && x.verdict === 'allowed' && x.recursive === true && x.command === cmd)
+    checkAudit(!!rec, '审计：放行的递归删除记录 allowed + recursive')
+  }
+
+  // 3. 放行的非递归删除：默认不记
+  {
+    const before = readAudit().filter((x) => x.event === 'delete-intent').length
+    const file = auditPath.join(auditRoot, 'single.txt')
+    const { pre } = makeListeners(auditCfg)
+    const cmd = "Remove-Item -LiteralPath '" + file + "' -Force"
+    await run(pre, 'pwsh', { command: cmd })
+    const after = readAudit().filter((x) => x.event === 'delete-intent').length
+    checkAudit(after === before, '审计：放行的非递归删除默认不记录')
+  }
+
+  // 4. 被拦截的自动变量赋值：即使不是递归删除也记
+  {
+    const { pre } = makeListeners(auditCfg)
+    const cmd = '$' + 'home = "C:"'
+    const r = await run(pre, 'pwsh', { command: cmd })
+    const rec = readAudit().find((x) => x.event === 'delete-intent' && x.rule === 'R1')
+    checkAudit(r.denied && !!rec && rec.verdict === 'blocked', '审计：被拦截的自动变量赋值也记录')
+  }
+
+  // 5. 被拦截的脚本写入：source/script
+  {
+    const { pre } = makeListeners(auditCfg)
+    const scriptPath = auditPath.join(auditRoot, 'bad.ps1')
+    const body = '$' + 'home = "C:"'
+    const r = await run(pre, 'write', { file_path: scriptPath, content: body })
+    const rec = readAudit().find((x) => x.event === 'delete-intent' && x.source === 'script-write')
+    checkAudit(r.denied && !!rec && rec.rule === 'R1' && rec.script === scriptPath, '审计：被拦截的脚本写入记录 source/script')
+  }
+
+  // 6. 审计目录自保护：R7
+  {
+    const { pre } = makeListeners(auditCfg)
+    const cmd = "Remove-Item -LiteralPath '" + auditDir + "' -Recurse -Force"
+    const r = await run(pre, 'pwsh', { command: cmd })
+    const rec = readAudit().find((x) => x.event === 'delete-intent' && x.rule === 'R7')
+    checkAudit(r.denied && !!rec && rec.verdict === 'blocked', '审计：审计目录自保护 R7')
+  }
+
+  // 6b. 审计目录的祖先也受保护
+  {
+    const { pre } = makeListeners(auditCfg)
+    const cmd = "Remove-Item -LiteralPath '" + auditRoot + "' -Recurse -Force"
+    const r = await run(pre, 'pwsh', { command: cmd })
+    const rec = readAudit().find((x) => x.event === 'delete-intent' && x.rule === 'R7')
+    checkAudit(r.denied && !!rec, '审计：审计目录的祖先也受 R7 保护')
+  }
+
+  // 7. 日志目录不可写时，拦截仍然生效
+  {
+    const protectedDir = auditFs.mkdtempSync(auditPath.join(auditOs.tmpdir(), 'dsh-guard-protected2-'))
+    const badDir = auditPath.join(auditRoot, 'not-a-dir')
+    auditFs.writeFileSync(badDir, 'x')
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const { pre } = makeListeners({ auditLog: true, auditDir: badDir, protectedPaths: [protectedDir] })
+      const cmd = "Remove-Item -LiteralPath '" + protectedDir + "' -Recurse -Force"
+      const r = await run(pre, 'pwsh', { command: cmd })
+      checkAudit(r.denied === true, '审计：日志写不进去时拦截仍然生效')
+    } finally {
+      console.warn = originalWarn
+    }
+  }
+
+  // 8. 过期日志清理
+  {
+    const retentionDir = auditPath.join(auditRoot, 'retention')
+    auditFs.mkdirSync(retentionDir, { recursive: true })
+    const oldFile = auditPath.join(retentionDir, 'audit-2020-01-01.jsonl')
+    auditFs.writeFileSync(oldFile, '{}\n')
+    const old = new Date(Date.now() - 40 * 86400000)
+    auditFs.utimesSync(oldFile, old, old)
+    makeListeners({ auditLog: true, auditDir: retentionDir, auditRetentionDays: 30 })
+    checkAudit(!auditFs.existsSync(oldFile), '审计：超过保留期的日志在启动时清理')
+  }
+
+  // 9. 放行后的结果记录
+  {
+    const { pre, result } = makeListeners(auditCfg)
+    const target = auditPath.join(auditRoot, 'result-probe')
+    const exec = {
+      name: 'pwsh',
+      callId: 'audit-result-1',
+      rootCallId: 'audit-result-1',
+      arguments: { command: "Remove-Item -LiteralPath '" + target + "' -Recurse -Force" },
+    }
+    await pre(exec, async () => ({ kind: 'allow' }))
+    if (typeof result === 'function') result(exec, { isError: false, value: null, content: [] })
+    const rec = readAudit().find((x) => x.event === 'delete-result' && x.callId === 'audit-result-1')
+    checkAudit(!!rec && rec.isError === false && typeof rec.durationMs === 'number', '审计：放行的递归删除追加结果记录')
+  }
+
+  try { auditFs.rmSync(auditRoot, { recursive: true, force: true }) } catch {}
+}
 
 console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`)
 

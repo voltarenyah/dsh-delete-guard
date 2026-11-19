@@ -3,11 +3,14 @@
 [English](./README.md) | **简体中文**
 
 面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的删除闸门。它在宿主的
-`tools/pre-execute` 接缝上检查每一条 shell 命令，拒绝那些"删了就找不回来"的操作。
+`tools/pre-execute` 接缝上检查每一条 shell 命令，拒绝那些"删了就找不回来"的操作；同时把递归删除
+和被拦截的调用写入本地审计日志，便于误删后回溯。
 
 策略层，不是沙箱：它决定**一条命令能不能跑**，不接管文件系统调用。
 
 ![删除闸门设置页](docs/settings-zh.png)
+
+> 截图来自 1.3.1；1.4.0 在页面下方新增“删除审计日志”和“Windows 卷影副本”两张卡片。
 
 ## 拦什么
 
@@ -19,6 +22,10 @@
 | **写入脚本时扫正文** | 写 `.ps1`、`.sh`、`.py`、`.js`、`.cmd`、`.bat` 时，正文命中上面任一规则 | 拒绝写入 |
 | **执行脚本前扫正文** | 通过 `-File`、`./x.ps1`、`bash x.sh`、`node x.mjs` 执行脚本，内容命中上面任一规则 | 拒绝执行 |
 | **删除频率熔断** | 窗口内的删除类命令超过阈值 | 拒绝 |
+| **审计目录自保护** | 删除审计日志目录、它的祖先，或目录中的文件 | 拒绝 |
+
+除了拦截，插件还会把递归删除（放行与拦截）以及所有被拦截的调用写入本地审计日志；
+默认目录是 `$DSH_HOME/delete-guard/audit`，可用 `auditLog` / `auditRetentionDays` 调整。
 
 第一条为什么必要：PowerShell 变量名大小写不敏感，`$home` **就是** `$HOME`。给它赋值是**非终止错误**，
 脚本继续执行，之后每一次 `$home` 仍然指向用户主目录。一条看起来"删临时目录"的命令，可能删掉整个用户目录。
@@ -48,7 +55,7 @@ dsh plugin --profile <profile> add @voltarenyah/dsh-delete-guard
 ## 设置
 
 全部在 **设置 → 删除闸门** 里改，下一次工具调用即生效（无需重启）：两个开关、受保护路径清单、
-熔断阈值与窗口。
+熔断阈值与窗口、审计日志开关与保留天数。
 
 | 配置项 | 默认 | 含义 |
 |---|---|---|
@@ -59,6 +66,9 @@ dsh plugin --profile <profile> add @voltarenyah/dsh-delete-guard
 | `protectedPaths` | 按平台生成（见下） | 不接受递归删除的路径清单，每条带 `enabled` 开关 |
 | `maxDeletesPerWindow` | `20` | 窗口内允许的删除命令数，`0` 关闭 |
 | `windowSeconds` | `60` | 熔断窗口（秒） |
+| `auditLog` | `true` | 把递归删除与被拦截的调用写入审计日志 |
+| `auditRetentionDays` | `30` | 审计日志保留天数，`0` 表示不自动清理 |
+| `auditDir` | `$DSH_HOME/delete-guard/audit` | 审计日志目录；一般不需要改 |
 
 ## 被拦截时
 
@@ -100,7 +110,89 @@ To proceed: …
       - D:\Projects\keep
     maxDeletesPerWindow: 20
     windowSeconds: 60
+    auditLog: true
+    auditRetentionDays: 30
 ```
+
+## 删除审计日志
+
+默认开启。日志在 `$DSH_HOME/delete-guard/audit`（Windows 通常是
+`C:\Users\<name>\.dsh\delete-guard\audit`），按天一个 JSONL 文件。
+
+默认记录：
+
+- **递归删除**（放行和拦截都记）；
+- **所有被拦截的调用**（自动变量、变量目标、保护路径、频率熔断、脚本扫描、审计目录自保护）；
+- 执行脚本时，如果脚本正文里含递归删除，会额外记一条 `script-exec`。
+
+放行的普通非递归删除默认不记，避免日志被大量单文件删除淹没。
+
+每条 `delete-intent` 记录包含：
+
+| 字段 | 含义 |
+|---|---|
+| `ts` / `tz` | UTC 时间与本地时区 |
+| `tool` / `callId` / `sessionId` | 哪个工具、哪次调用、哪个会话 |
+| `cwd` | 会话工作目录 |
+| `command` | 命令原文（超过 8 KiB 截断，`truncated` 标记） |
+| `targets` | 从命令里解析出的字面目标路径 |
+| `recursive` / `verdict` / `rule` | 是否递归、放行还是拦截、命中哪条规则（R1–R7） |
+| `blockers` | 拦截时列出所有挡路的保护项 |
+| `severity` | `critical`（变量/保护路径/自保护）或 `high`（熔断/脚本/放行的递归删除） |
+
+放行的递归删除还会追加一条 `delete-result`，记录 `isError`、`errorCode` 和 `durationMs`。
+
+查误删时，可以按时间找到当天的文件，再过滤：
+
+```powershell
+$dir = "$env:USERPROFILE\.dsh\delete-guard\audit"
+Get-ChildItem -LiteralPath $dir -Filter 'audit-*.jsonl' |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1 |
+  Get-Content |
+  Select-String '"verdict":"blocked"'
+```
+
+如果 `DSH_HOME` 改过，把 `$dir` 换成实际目录。日志目录本身受保护：删除其中的文件会被
+规则 R7 拒绝，避免把留档一起删掉。R7 是内置规则，设置页没有对应开关。
+
+边界：
+
+- 日志只记录**调用**，不保存文件内容；它回答“谁在什么时候对哪个目录执行了什么”，
+  不回答“目录里原来有哪些文件”。
+- 日志不是不可篡改的账本；agent 仍可能有文件权限。R7 只挡工具层的删除调用。
+- 命令原文可能包含 token/密码。目录只给当前用户，保留期默认 30 天。
+- 日志写入失败不会改变拦截结果；失败只在控制台告警。
+
+## Windows 卷影副本
+
+Windows 的卷影副本时间需要**管理员权限**才能读取。DSH 以普通用户运行，
+`vssadmin`、`wbadmin`、`Get-ComputerRestorePoint` 都会被拒绝，所以设置页只显示
+查询方法，不自动提权。
+
+在“以管理员身份运行”的 PowerShell 中执行：
+
+```powershell
+vssadmin list shadows
+```
+
+也可以：
+
+```powershell
+Get-CimInstance Win32_ShadowCopy |
+  Sort-Object InstallDate -Descending |
+  Select-Object InstallDate, VolumeName
+```
+
+同样需要管理员。输出里看最近一条卷影副本的创建时间，就是“上次存档”的近似时间。
+
+注意：
+
+- 卷影副本**不等于完整备份**；系统保护创建的还原点主要覆盖系统文件/注册表，
+  不保证包含用户文件。
+- 卷影副本按卷存在，数据盘和系统盘可能情况不同。
+- 卷影存储满了，旧副本会被自动删除；最新的副本也不一定包含你刚删的文件。
+- 不建议为了让插件读到时间而把整个 DSH 以管理员运行。
 
 ## 默认保护路径
 
@@ -137,11 +229,14 @@ To proceed: …
 | 持久终端里分多次输入拼出的命令 | 每次只看本次文本 |
 | `robocopy /MIR`、`git clean -fdx` 等非删除动词的批量删除 | 不在删除动词集合内 |
 | 已放行的命令真正执行后的后果 | 本插件不接管文件系统删除，也不提供回收站 |
+| 审计日志只记录调用，不保存文件内容 | 它回答“谁在何时对哪个路径执行了什么”，恢复仍需卷影副本/备份 |
+| 审计日志不是不可篡改账本 | agent 仍可能有文件权限；R7 只挡工具层删除审计目录的调用 |
+| 卷影副本时间需要管理员权限 | 插件不自动提权；设置页只给命令，需在管理员 PowerShell 里运行 |
 
 熔断计的是**工具调用**，不是文件数：一条命令删 10 万个文件只算 1 次。
 
-需要"删了还能拿回来"，请配合卷影副本/备份，或另装回收站类插件（如 `dsh-safe-delete`、
-`dsh-delete-guard`）；本插件专注"根本不发生"。
+审计日志用于事后回溯，不用于恢复。需要"删了还能拿回来"，请配合卷影副本/备份，或另装回收站类
+插件（如 `dsh-safe-delete`、`dsh-delete-guard`）；本插件专注"根本不发生"。
 
 ## 许可
 

@@ -10,8 +10,17 @@
 // 设计取向：fail-closed 只发生在「删除」这一动作上；其余工具调用一律放行。
 // 守卫自身任何异常都不阻断宿主工具面（catch 后放行）。
 
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import {
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+} from 'node:fs'
+import { homedir, hostname } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
@@ -68,6 +77,33 @@ const DELETE_RES = [
 
 const WIN = process.platform === 'win32'
 const MAC = process.platform === 'darwin'
+
+/** 插件版本，写进审计记录，便于事后对日志格式。 */
+const PLUGIN_VERSION = (() => {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+    return typeof manifest.version === 'string' ? manifest.version : '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
+
+const AUDIT_TZ = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || null
+  } catch {
+    return null
+  }
+})()
+
+/** 单条记录里命令原文的上限；超出部分截断，并记录原长度。 */
+const AUDIT_MAX_COMMAND_CHARS = 8 * 1024
+/** 单条记录里目标路径/阻断项的上限。 */
+const AUDIT_MAX_TARGETS = 20
+/** 单个日志文件的上限；超过后换下一个序号文件。 */
+const AUDIT_MAX_FILE_BYTES = 16 * 1024 * 1024
+/** 只清理本插件自己的日志文件，不碰目录里的其它东西。 */
+const AUDIT_FILE_RE = /^audit-\d{4}-\d{2}-\d{2}(?:-\d+|overflow)?\.jsonl$/i
 
 /**
  * 路径字面量：引号串、`~` 开头、Windows 盘符/UNC、POSIX 绝对路径。
@@ -187,6 +223,39 @@ function number(config, name, fallback) {
   return Number.isFinite(n) ? n : fallback
 }
 
+/** 读取字符串型配置（兼容 volatile）；空串按 fallback 处理。 */
+function text(config, name, fallback) {
+  const raw = config ? config[name] : undefined
+  let value = raw
+  if (raw && typeof raw.get === 'function') {
+    try {
+      value = raw.get()
+    } catch {
+      return fallback
+    }
+  }
+  return typeof value === 'string' && value.trim() ? value.trim() : fallback
+}
+
+/** 运行时解析 DSH_HOME；空值回落到 ~/.dsh。 */
+function resolveDshHome() {
+  const env = process.env.DSH_HOME
+  return typeof env === 'string' && env.trim() ? env.trim() : join(homedir(), '.dsh')
+}
+
+/** 默认审计目录：$DSH_HOME/delete-guard/audit。 */
+function defaultAuditDir() {
+  return join(resolveDshHome(), 'delete-guard', 'audit')
+}
+
+/** target 是否就是 dir 或在 dir 下面。 */
+function isInsideDir(target, dir) {
+  const a = norm(target)
+  const b = norm(dir)
+  if (!a || !b) return false
+  return a === b || a.startsWith(withSep(b))
+}
+
 /**
  * 默认保护清单。
  *
@@ -235,6 +304,8 @@ const DEFAULTS = {
   scanScriptExec: true,
   maxDeletesPerWindow: 20,
   windowSeconds: 60,
+  auditLog: true,
+  auditRetentionDays: 30,
 }
 
 export const Config = Schema.object({
@@ -258,6 +329,12 @@ export const Config = Schema.object({
     .description('删除熔断阈值：时间窗口内允许的删除类命令数，0 表示关闭'),
   windowSeconds: Schema.number().default(60).volatile()
     .description('删除熔断的时间窗口（秒）'),
+  auditLog: Schema.boolean().default(true).volatile()
+    .description('把递归删除与被拦截的调用写入审计日志（默认开启）'),
+  auditRetentionDays: Schema.number().default(30).volatile()
+    .description('审计日志保留天数；0 表示不自动清理'),
+  auditDir: Schema.string().default(defaultAuditDir()).volatile()
+    .description('审计日志目录；默认 $DSH_HOME/delete-guard/audit'),
 })
 
 /** 递归删除命令的「参数区」：从动词位置到行尾。 */
@@ -373,7 +450,7 @@ function blocked(en, zh) {
 
 const PROTOCOL_SECTION = `## 删除命令硬约束（dsh-delete-guard）
 
-执行任何删除前先读这三条，违反会被工具层直接拒绝：
+执行任何删除前先读这些规则，违反会被工具层直接拒绝：
 
 1. **禁止给 PowerShell 自动变量赋值**：\`$home\` \`$profile\` \`$pwd\` \`$input\` \`$args\` \`$host\` \`$pid\`
    \`$error\` \`$this\` \`$matches\` \`$pshome\` \`$PSScriptRoot\` \`$LASTEXITCODE\` 等。变量名大小写不敏感，
@@ -394,6 +471,8 @@ const PROTOCOL_SECTION = `## 删除命令硬约束（dsh-delete-guard）
    When blocked, do not work around the check. For the variable rules, rewrite the command with a literal
    path. For a protected path, explain it and ask the user to switch that single entry off in
    Settings → Delete guard, then retry.
+
+删除类调用会写入审计日志（默认 \`$DSH_HOME/delete-guard/audit\`）；该目录本身受保护，设置页里没有对应开关，不要删除或改写其中的文件。
 
 要清理某个构建产物或测试目录时：\`$p = 'C:\\...\\dist'; Get-ChildItem -LiteralPath $p | Measure-Object\`
 先看规模，再 \`Remove-Item -LiteralPath 'C:\\...\\dist' -Recurse -Force\`（字面量，不带变量）。`
@@ -454,15 +533,195 @@ export default {
       return deleteLog.length > max
     }
 
+    // ---- 审计日志 ---------------------------------------------------------
+    const auditPending = new Map()
+    let auditDirCache = null
+    let auditDirReady = false
+    let auditLastCleanup = 0
+
+    /** 配置里的审计目录；空值或非绝对路径回落到默认目录。 */
+    function configuredAuditDir() {
+      const candidate = text(config, 'auditDir', '')
+      const dir = candidate || defaultAuditDir()
+      return isAbsoluteForPlatform(dir) ? dir : defaultAuditDir()
+    }
+
+    /** 创建并缓存审计目录；失败时返回 null，绝不阻断工具调用。 */
+    function ensureAuditDir() {
+      const next = configuredAuditDir()
+      if (auditDirReady && auditDirCache === next) return next
+      try {
+        mkdirSync(next, { recursive: true, mode: 0o700 })
+        auditDirCache = next
+        auditDirReady = true
+        auditLastCleanup = 0
+        return next
+      } catch (error) {
+        auditDirCache = next
+        auditDirReady = false
+        try {
+          console.warn('[dsh-delete-guard] audit directory unavailable:', error && error.message)
+        } catch {}
+        return null
+      }
+    }
+
+    /** 当天日志文件；超过大小上限时换序号。 */
+    function auditFileFor(dir) {
+      const now = new Date()
+      const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+      for (let i = 0; i < 50; i++) {
+        const name = i === 0 ? `audit-${date}.jsonl` : `audit-${date}-${i + 1}.jsonl`
+        const file = join(dir, name)
+        try {
+          if (statSync(file).size < AUDIT_MAX_FILE_BYTES) return file
+        } catch {
+          return file
+        }
+      }
+      return join(dir, `audit-${date}-overflow.jsonl`)
+    }
+
+    /** 清理超过保留期的日志；只碰本插件命名格式的普通文件。 */
+    function cleanupAudit() {
+      const days = Math.max(0, number(config, 'auditRetentionDays', DEFAULTS.auditRetentionDays))
+      if (days <= 0) return
+      const dir = ensureAuditDir()
+      if (!dir) return
+      const cutoff = Date.now() - days * 86400000
+      let entries
+      try {
+        entries = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        if (!entry.isFile() || !AUDIT_FILE_RE.test(entry.name)) continue
+        const file = join(dir, entry.name)
+        try {
+          const info = lstatSync(file)
+          if (info.isFile() && info.mtimeMs < cutoff) unlinkSync(file)
+        } catch {}
+      }
+    }
+
+    /** 每天最多清理一次。 */
+    function maybeAuditCleanup() {
+      if (!flag(config, 'auditLog', true)) return
+      const now = Date.now()
+      if (now - auditLastCleanup < 86400000) return
+      auditLastCleanup = now
+      try {
+        cleanupAudit()
+      } catch {}
+    }
+
+    /** 追加一条 JSONL；失败只告警，不影响闸门判定。 */
+    function appendAudit(record) {
+      if (!flag(config, 'auditLog', true)) return
+      try {
+        const dir = ensureAuditDir()
+        if (!dir) return
+        maybeAuditCleanup()
+        const line = `${JSON.stringify(record)}\n`
+        appendFileSync(auditFileFor(dir), line, { encoding: 'utf8', mode: 0o600 })
+      } catch (error) {
+        try {
+          console.warn('[dsh-delete-guard] audit write failed:', error && error.message)
+        } catch {}
+      }
+    }
+
+    /**
+     * 记录一次删除意图。pending=true 时登记 callId，等 tools/result 再写结果。
+     */
+    function logIntent(exec, source, body, detail, extra, pending) {
+      if (!flag(config, 'auditLog', true)) return
+      try {
+        const targets = Array.isArray(detail?.targets) ? detail.targets : []
+        const blockers = Array.isArray(detail?.blockers) ? detail.blockers : []
+        const record = {
+          schema: 1,
+          ts: new Date().toISOString(),
+          tz: AUDIT_TZ,
+          event: 'delete-intent',
+          tool: exec?.name ?? null,
+          callId: exec?.callId ?? null,
+          rootCallId: exec?.rootCallId ?? null,
+          sessionId: exec?.agent?.session?.id ?? null,
+          cwd: exec?.agent?.session?.header?.cwd ?? null,
+          source,
+          command: typeof body === 'string' ? body.slice(0, AUDIT_MAX_COMMAND_CHARS) : '',
+          commandLength: typeof body === 'string' ? body.length : 0,
+          truncated: typeof body === 'string' ? body.length > AUDIT_MAX_COMMAND_CHARS : false,
+          targets: targets.slice(0, AUDIT_MAX_TARGETS),
+          targetsTruncated: targets.length > AUDIT_MAX_TARGETS,
+          recursive: detail?.recursive === true,
+          verdict: detail?.rule ? 'blocked' : 'allowed',
+          rule: detail?.rule ?? null,
+          blockers: blockers.slice(0, AUDIT_MAX_TARGETS),
+          severity: detail?.severity ?? 'high',
+          pid: process.pid,
+          version: PLUGIN_VERSION,
+          host: hostname(),
+          ...(extra && typeof extra === 'object' ? extra : {}),
+        }
+        appendAudit(record)
+        if (pending && exec?.callId) {
+          if (auditPending.size >= 500) {
+            const oldest = auditPending.keys().next().value
+            if (oldest !== undefined) auditPending.delete(oldest)
+          }
+          auditPending.set(exec.callId, { startedAt: Date.now() })
+        }
+      } catch (error) {
+        try {
+          console.warn('[dsh-delete-guard] audit intent failed:', error && error.message)
+        } catch {}
+      }
+    }
+
+    /** 把一次命令拆成可审计的结构：是否递归、字面目标。 */
+    function inspectDelete(body) {
+      const regions = destructiveRegions(body)
+      const targets = pathTokensOf(regions.join('\n'))
+      return { recursive: regions.length > 0, targets }
+    }
+
+    /** 统一构造拒绝结果；decision 给宿主，detail 给审计。 */
+    function fail(rule, reason, detail = {}) {
+      const severity = detail.severity || (rule === 'R4' || rule === 'R5' || rule === 'R6' ? 'high' : 'critical')
+      return {
+        decision: { kind: 'deny', reason },
+        detail: { rule, severity, recursive: false, targets: [], blockers: [], ...detail },
+      }
+    }
+
     function evaluate(text) {
       // R1：自动变量赋值
       if (flag(config, 'blockAutoVarAssignment', true)) {
         const m = ASSIGN_RE.exec(text)
         if (m) {
-          return deny(blocked(
+          return fail('R1', blocked(
             `Assigning to the PowerShell automatic variable ${m[0].trim()} is not allowed. Variable names are case-insensitive, so $home is the read-only $HOME (the user home): the assignment raises a non-terminating error, the script keeps running, and later lines still resolve to the home directory. Use $dshHome / $targetDir / $outDir instead.`,
             `不能给 PowerShell 自动变量赋值（${m[0].trim()}）。变量名大小写不敏感，$home 就是只读的 $HOME（用户主目录）；赋值只报非终止错误，脚本继续执行，后续命令拿到的仍是主目录。改用 $dshHome / $targetDir / $outDir 这类名字。`,
-          ))
+          ), { recursive: inspectDelete(text).recursive })
+        }
+      }
+
+      // R7：审计目录自保护。任何删除动词 + 字面目标命中审计目录（或其祖先）都拒绝，
+      // 不只递归删除，避免用单文件删除绕过。非递归删除没有“参数区”，退回整段文本。
+      const auditDir = configuredAuditDir()
+      if (auditDir && hasDeleteIntent(text)) {
+        const regions7 = destructiveRegions(text)
+        const r7Text = regions7.length > 0 ? regions7.join('\n') : text
+        for (const token of pathTokensOf(r7Text)) {
+          if (isInsideDir(token, auditDir) || isInsideDir(auditDir, token)) {
+            return fail('R7', blocked(
+              `Deleting ${token} is refused: it is inside or contains the delete-guard audit directory (${auditDir}). The audit log is kept for incident review; do not delete or rewrite it.`,
+              `拒绝删除 ${token}：它在删除闸门的审计目录（${auditDir}）里，或是它的祖先。审计日志用于误删留档；不要删除或改写它。`,
+            ), { recursive: regions7.length > 0, targets: [token], blockers: [auditDir] })
+          }
         }
       }
 
@@ -472,10 +731,10 @@ export default {
 
       // R2：参数区里带变量
       if (flag(config, 'blockVariableDelete', true) && /[$%]/.test(targetText)) {
-        return deny(blocked(
+        return fail('R2', blocked(
           'A recursive delete whose arguments contain `$` or `%` is refused: the target must be a literal path that was actually resolved. Do not build a delete target and delete it in one step.',
           '递归删除的参数里出现 `$` 或 `%`，拒绝执行：删除目标必须是已解析出来的字面路径，不要在同一行里既拼变量又删。',
-        ))
+        ), { recursive: true })
       }
 
       // R3：受保护路径
@@ -487,10 +746,10 @@ export default {
         if (blockers.length === 0) continue
         const detail = blockers.slice(0, 6).join('、')
         const extra = blockers.length > 6 ? ` …(+${blockers.length - 6})` : ''
-        return deny(blocked(
+        return fail('R3', blocked(
           `Recursive delete of ${target} is refused: ${blockers.length === 1 ? 'it is a protected path' : `${blockers.length} protected entries are inside it`} (${detail}${extra}). The list and a per-entry switch live in Settings → Delete guard. To clean something inside it, target the concrete subdirectory; if this path itself must be deleted, switch those entries off first.`,
           `拒绝递归删除 ${target}：${blockers.length === 1 ? '它是受保护路径' : `它下面有 ${blockers.length} 条受保护路径`}（${detail}${extra}）。清单与每条的开关在 设置 → 删除闸门。要清理其中的子目录，请直接指向那个子目录；如果确实要删这条路径本身，先把这些条目的开关关掉。`,
-        ))
+        ), { recursive: true, targets: [token], blockers })
       }
 
       // R4 在监听器里统一计数，此处不再重复判定
@@ -512,10 +771,11 @@ export default {
               if (typeof body === 'string' && body.length > 0) {
                 const verdict = evaluate(body)
                 if (verdict) {
-                  return deny(
+                  const reason =
                     `dsh-delete-guard blocked this call: the script body hits the delete rules (${target}).\n` +
-                    `dsh-delete-guard 已拦截：脚本正文命中删除规则（${target}）。\n\n${verdict.reason}`,
-                  )
+                    `dsh-delete-guard 已拦截：脚本正文命中删除规则（${target}）。\n\n${verdict.decision.reason}`
+                  logIntent(exec, 'script-write', body, verdict.detail, { script: target })
+                  return deny(reason)
                 }
               }
             }
@@ -527,6 +787,8 @@ export default {
         const texts = collectStrings(exec.arguments ?? {}, [])
         if (texts.length === 0) return next()
         const text = texts.join('\n')
+        const intent = inspectDelete(text)
+        const allowedScripts = []
 
         // R6：执行脚本前读文件，用同一套规则扫描
         if (flag(config, 'scanScriptExec', true)) {
@@ -535,10 +797,19 @@ export default {
             if (body === null) continue
             const verdict = evaluate(body)
             if (verdict) {
-              return deny(
+              const reason =
                 `dsh-delete-guard blocked this call: the script ${file} hits the delete rules.\n` +
-                `dsh-delete-guard 已拦截：被调用脚本 ${file} 的内容命中删除规则。\n\n${verdict.reason}`,
-              )
+                `dsh-delete-guard 已拦截：被调用脚本 ${file} 的内容命中删除规则。\n\n${verdict.decision.reason}`
+              logIntent(exec, 'script-exec', body, verdict.detail, { script: file })
+              return deny(reason)
+            }
+            const bodyIntent = inspectDelete(body)
+            if (bodyIntent.recursive) {
+              allowedScripts.push({
+                file,
+                body,
+                detail: { rule: null, recursive: true, targets: bodyIntent.targets, severity: 'high' },
+              })
             }
           }
         }
@@ -547,14 +818,34 @@ export default {
         if (hasDeleteIntent(text) && tripped()) {
           const max = number(config, 'maxDeletesPerWindow', DEFAULTS.maxDeletesPerWindow)
           const windowSeconds = number(config, 'windowSeconds', DEFAULTS.windowSeconds)
-          return deny(blocked(
+          const rate = fail('R4', blocked(
             `More than ${max} delete commands in ${windowSeconds} seconds: the rate limit tripped. Splitting one bulk delete into many single deletes is refused the same way. Do one explicit cleanup (Measure-Object, then a single delete on a concrete directory) or wait for the window.`,
             `${windowSeconds} 秒内删除类命令超过 ${max} 次，触发熔断。把一次批量删除拆成很多次单个删除同样会被拒绝；请先 Measure-Object 统计条目数，再对一个具体目录执行一次删除，或等窗口过去。`,
-          ))
+          ), { recursive: intent.recursive, targets: intent.targets })
+          logIntent(exec, 'shell', text, rate.detail)
+          return rate.decision
         }
 
         const verdict = evaluate(text)
-        if (verdict) return verdict
+        if (verdict) {
+          logIntent(exec, 'shell', text, verdict.detail)
+          return verdict.decision
+        }
+
+        // 放行：默认只记递归删除；脚本里含递归删除时也记一条。
+        for (const item of allowedScripts) {
+          logIntent(exec, 'script-exec', item.body, item.detail, { script: item.file }, true)
+        }
+        if (intent.recursive) {
+          logIntent(
+            exec,
+            'shell',
+            text,
+            { rule: null, recursive: true, targets: intent.targets, severity: 'high' },
+            undefined,
+            true,
+          )
+        }
       } catch (error) {
         try {
           console.error('[dsh-delete-guard] guard failed, allowing call:', error && error.message)
@@ -563,11 +854,47 @@ export default {
       return next()
     })
 
+    // 只给已登记的“放行的递归删除”补一条结果记录，避免日志里出现无关工具结果。
+    ctx.on('tools/result', (exec, result) => {
+      try {
+        if (!exec || !exec.callId) return
+        const pending = auditPending.get(exec.callId)
+        if (!pending) return
+        auditPending.delete(exec.callId)
+        appendAudit({
+          schema: 1,
+          ts: new Date().toISOString(),
+          tz: AUDIT_TZ,
+          event: 'delete-result',
+          tool: exec.name,
+          callId: exec.callId,
+          rootCallId: exec.rootCallId ?? null,
+          sessionId: exec.agent?.session?.id ?? null,
+          cwd: exec.agent?.session?.header?.cwd ?? null,
+          isError: result?.isError === true,
+          errorCode: result?.isError ? (result.error?.info?.code ?? null) : null,
+          durationMs: Date.now() - pending.startedAt,
+          pid: process.pid,
+          version: PLUGIN_VERSION,
+          host: hostname(),
+        })
+      } catch (error) {
+        try {
+          console.warn('[dsh-delete-guard] audit result failed:', error && error.message)
+        } catch {}
+      }
+    })
+
     try {
       const systemPrompt = ctx.get('systemPrompt')
       if (systemPrompt && typeof systemPrompt.section === 'function') {
         ctx.effect(() => systemPrompt.section({ name: 'dsh-delete-guard-rules', order: 900, text: PROTOCOL_SECTION }))
       }
+    } catch {}
+
+    // 启动时做一次过期日志清理；失败不影响闸门。
+    try {
+      maybeAuditCleanup()
     } catch {}
   },
 }
